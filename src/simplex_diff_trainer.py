@@ -3,6 +3,7 @@ import time
 import math
 import os
 import re
+import json
 import torch.nn as nn
 import numpy as np
 import torch.nn.functional as F
@@ -53,6 +54,7 @@ class Simplex_Trainer:
         self.optimizer = Adam(self.simplex_diffs.parameters(), lr=self.args.diff_lr, \
                             weight_decay=0.0, betas=(0.9, 0.999), amsgrad=False, eps=1e-08)
 
+        # 设置模型保存路径
         self.model_path = "/storage/home/hcoda1/7/lye48/p-schava6-0/weak_supervision/SiDyP/best_models/"
         if self.args.noise_type == "llm":
             self.model_path += f"{self.args.noise_type}/{self.args.prompt_type}/{self.args.llm_type}/{self.args.dataset}/{self.args.seed}"
@@ -60,6 +62,17 @@ class Simplex_Trainer:
             self.model_path += f"{self.args.dataset}/{self.args.seed}"
         elif self.args.noise_type == "synthetic":
             self.model_path += f"{self.args.dataset}/{self.args.noise_ratio}/{self.args.syn_type}"
+        elif self.args.ldl:
+            # LDL模式下的模型保存路径
+            self.model_path += f"ldl/{os.path.basename(self.args.dataset_path)}/{self.args.seed}"
+        
+        # 创建模型保存目录
+        os.makedirs(self.model_path, exist_ok=True)
+        
+        # 训练监控：记录loss变化
+        self.train_loss_history = []
+        self.valid_loss_history = []
+        self.epoch_losses = []
                             
     def sample_uncertain_y(self, y, weights, uncertain_idx):
 
@@ -230,66 +243,145 @@ class Simplex_Trainer:
             
             return total_loss / num_steps
             
-    def evaluate(self, epoch, eval_loader):
-        self.best_plc.eval()
+    def evaluate(self, epoch, eval_loader, return_predictions=False):
+        # 检查best_plc是否为None（LDL模式下为None）
+        if self.best_plc is not None:
+            self.best_plc.eval()
         self.simplex_diffs.eval()
         start = time.time()
         with torch.no_grad():
             correct = 0
             plm_correct = 0
             all_sample = 0
+            all_targets = []  # 保存真实标签分布
+            
+            # 准备保存多次inference结果
+            num_inference = 10
+            all_inference_predictions = []
             
             for test_batch_idx, data_batch in tqdm(enumerate(eval_loader), total=len(eval_loader), desc=f'Simplex Diffusion Sampling...', ncols=100):
                 input_ids, input_mask, target, w, x_embed = data_batch 
-                outputs = self.best_plc(input_ids, attention_mask=input_mask)
                 w = w.squeeze().to(self.args.device)
                 target = target.squeeze().to(self.args.device)
-
                 
-                logits = [output[0] for output in outputs]
-                p_y_tilde = [F.softmax(logit, dim=-1).detach().cpu() for logit in logits]
-                avg_p_y_tilde = torch.mean(torch.stack(p_y_tilde, dim=0), 0)
-                _, plm_pred_labels = torch.max(avg_p_y_tilde, dim=-1)
+                # 保存真实标签
+                all_targets.append(target.detach().cpu().numpy())
+                
+                # 准备保存当前batch的多次inference结果
+                batch_predictions = []
+                
+                for inf_idx in range(num_inference):
+                    # 根据是否为LDL模式决定使用哪种逻辑
+                    if not self.args.ldl and self.best_plc is not None:
+                        # 原始模式下，使用best_plc生成文本的分类预测
+                        outputs = self.best_plc(input_ids, attention_mask=input_mask)
+                        logits = [output[0] for output in outputs]
+                        p_y_tilde = [F.softmax(logit, dim=-1).detach().cpu() for logit in logits]
+                        avg_p_y_tilde = torch.mean(torch.stack(p_y_tilde, dim=0), 0)
+                        _, plm_pred_labels = torch.max(avg_p_y_tilde, dim=-1)
+                    else:
+                        # LDL模式下，直接使用均匀分布作为p_y_tilde
+                        # 或者可以跳过PLM预测，仅使用simplex_diffs的结果
+                        # 这里使用均匀分布作为默认值，确保代码能够正常运行
+                        p_y_tilde = [torch.ones((target.size(0), self.args.num_classes)) / self.args.num_classes for _ in range(self.args.num_model)]
+                        # PLM预测标签使用随机值，因为在LDL模式下我们不关心PLM的预测
+                        plm_pred_labels = torch.zeros(target.size(0), dtype=torch.long)
 
-                p_y_y_tilde_list = []
-                for model_i in range(self.args.num_model):
-                    p_y_bar_x_y_tilde = torch.zeros(target.size(0), self.args.num_classes, self.args.num_classes).to(self.args.device)
-                    for label in range(self.args.num_classes):
-                        labels = torch.ones(target.size(0)) * label
-                        outpus = self.simplex_diffs[model_i].reverse_t(labels.to(self.args.device), w[:,model_i,:], x_embed, generator=torch.Generator(device=self.args.device).manual_seed(self.args.seed))
-                        prob = torch.softmax(outpus.simplex, dim=1)
-                        p_y_bar_x_y_tilde[:,:,label] = prob
+                    p_y_y_tilde_list = []
+                    for model_i in range(self.args.num_model):
+                        p_y_bar_x_y_tilde = torch.zeros(target.size(0), self.args.num_classes, self.args.num_classes).to(self.args.device)
+                        for label in range(self.args.num_classes):
+                            labels = torch.ones(target.size(0)) * label
+                            # 使用不同的随机种子进行多次inference
+                            seed = self.args.seed + inf_idx
+                            outpus = self.simplex_diffs[model_i].reverse_t(labels.to(self.args.device), w[:,model_i,:], x_embed, generator=torch.Generator(device=self.args.device).manual_seed(seed))
+                            prob = torch.softmax(outpus.simplex, dim=1)
+                            p_y_bar_x_y_tilde[:,:,label] = prob
 
+                        
+                        # P(y|y^,x)*P(y^|x)=P(y,y^|x)
+                        p_y_expansion = p_y_tilde[model_i].squeeze().reshape(w.size(0), 1, self.args.num_classes).repeat([1, self.args.num_classes, 1])
+                        p_y_y_tilde = p_y_bar_x_y_tilde.cpu().detach() * p_y_expansion  # batch*class*label
+                        p_y_y_tilde_list.append(p_y_y_tilde)
                     
-                    # P(y|y^,x)*P(y^|x)=P(y,y^|x)
-                    p_y_expansion = p_y_tilde[model_i].squeeze().reshape(w.size(0), 1, self.args.num_classes).repeat([1, self.args.num_classes, 1])
-                    p_y_y_tilde = p_y_bar_x_y_tilde.cpu().detach() * p_y_expansion  # batch*class*label
-                    p_y_y_tilde_list.append(p_y_y_tilde)
-                if self.args.num_model == 1:
-                    p_y_y_tilde_final = p_y_y_tilde_list[-1].squeeze()
-                else:
-                    p_y_y_tilde_final = torch.stack(p_y_y_tilde_list, dim=0).mean(0)
-                _, pred_labels = torch.max(torch.sum(p_y_y_tilde_final, dim=2), dim=1)
-
-                correct += torch.sum(pred_labels==target.detach().cpu()).item()
+                    if self.args.num_model == 1:
+                        p_y_y_tilde_final = p_y_y_tilde_list[-1].squeeze()
+                    else:
+                        p_y_y_tilde_final = torch.stack(p_y_y_tilde_list, dim=0).mean(0)
+                    
+                    # 保存当前inference的预测分布
+                    batch_pred = torch.sum(p_y_y_tilde_final, dim=2).detach().cpu().numpy()
+                    batch_predictions.append(batch_pred)
+                
+                # 计算当前batch的平均预测分布
+                avg_batch_pred = np.mean(batch_predictions, axis=0)
+                all_inference_predictions.append(avg_batch_pred)
+                
+                # 计算准确率（用于兼容原有逻辑）
+                pred_labels = np.argmax(avg_batch_pred, axis=1)
+                correct += np.sum(pred_labels == target.detach().cpu().numpy())
                 plm_correct += torch.sum(plm_pred_labels==target.detach().cpu()).item()
-                all_sample += w.size(0)
+                all_sample += target.size(0)
 
         print(f'time cost for sampling: {time.time() - start}')
 
         acc = 100 * correct / all_sample
         plm_acc = 100 * plm_correct / all_sample
-        return acc, plm_acc
+        
+        if return_predictions:
+            # 合并所有批次的结果
+            all_inference_predictions = np.concatenate(all_inference_predictions, axis=0)
+            all_targets = np.concatenate(all_targets, axis=0)
+            return acc, plm_acc, all_inference_predictions, all_targets
+        else:
+            return acc, plm_acc
 
+    def compute_ldl_metrics(self, predictions, true_labels):
+        """
+        计算LDL指标
+        :param predictions: 预测的标签分布 (n_samples, n_classes)
+        :param true_labels: 真实的标签分布 (n_samples, n_classes)
+        :return: 六个LDL指标值
+        """
+        # 导入ldl_metrics模块
+        from ldl_metrics import score, proj
+        
+        # 使用proj函数将预测分布投影到概率单纯形
+        predictions_proj = proj(predictions)
+        
+        # 计算六个LDL指标
+        cheby, clark, can, kl, cosine, inter = score(true_labels, predictions_proj)
+        
+        print(f"LDL Metrics:")
+        print(f"  Chebyshev Distance: {cheby:.4f}")
+        print(f"  Clark Distance: {clark:.4f}")
+        print(f"  Canberra Distance: {can:.4f}")
+        print(f"  KL Divergence: {kl:.4f}")
+        print(f"  Cosine Similarity: {cosine:.4f}")
+        print(f"  Intersection Distance: {inter:.4f}")
+        
+        return cheby, clark, can, kl, cosine, inter
 
     def train(self):
         best_valid_acc = 0.0
         print('Simplex Diffusion Training Start')
         for epoch in range(self.args.diff_epochs):
             train_loss = self.update_model(epoch)
+            self.train_loss_history.append(train_loss)
             
-            # validation
-            if (epoch % 1 == 0 and epoch >= self.args.warmup_epochs*self.args.diff_epochs) or epoch == self.args.diff_epochs-1:
+            # validation - 减少simplex diffusion sampling的执行频率，只在最后几个epoch和warmup结束后执行
+            # 1. warmup结束后执行一次
+            # 2. 最后3个epoch每个都执行
+            # 3. 总训练epoch数较少时（<=5），每个epoch都执行
+            should_evaluate = False
+            if epoch == int(self.args.warmup_epochs*self.args.diff_epochs):
+                should_evaluate = True  # warmup结束后执行一次
+            elif epoch >= self.args.diff_epochs - 3:
+                should_evaluate = True  # 最后3个epoch每个都执行
+            elif self.args.diff_epochs <= 5:
+                should_evaluate = True  # 总epoch数较少时，每个epoch都执行
+            
+            if should_evaluate:
                 valid_acc, plm_acc  = self.evaluate(epoch, self.valid_dataloader)
                 if valid_acc > best_valid_acc:
                     print("Model Saved!")
@@ -297,13 +389,50 @@ class Simplex_Trainer:
                     self.best_diff_model = deepcopy(self.simplex_diffs)
                 print(f"Epoch {epoch}: PLM valid acc: {plm_acc}, Denoising valid acc: {valid_acc}")
 
+        # 保存loss历史记录
+        loss_history = {
+            'train_loss': self.train_loss_history,
+            'valid_loss': self.valid_loss_history
+        }
+        loss_path = os.path.join(self.model_path, 'loss_history.json')
+        with open(loss_path, 'w') as f:
+            json.dump(loss_history, f, indent=2)
+        
         self.test() 
     
     def test(self):
         del self.simplex_diffs
         self.simplex_diffs = self.best_diff_model
 
-        test_acc, plm_acc = self.evaluate(self.args.diff_epochs, self.test_dataloader)
+        if self.args.ldl:
+            # LDL模式下，获取预测结果并计算LDL指标
+            test_acc, plm_acc, predictions, true_labels = self.evaluate(self.args.diff_epochs, self.test_dataloader, return_predictions=True)
+            # 计算LDL指标
+            cheby, clark, can, kl, cosine, inter = self.compute_ldl_metrics(predictions, true_labels)
+            
+            # 保存测试结果到JSON文件
+            result_data = {
+                'metrics': {
+                    'chebyshev': float(cheby),
+                    'clark': float(clark),
+                    'canberra': float(can),
+                    'kl_div': float(kl),
+                    'cosine_similarity': float(cosine),
+                    'intersection': float(inter),
+                    'test_acc': float(test_acc),
+                    'plm_acc': float(plm_acc)
+                }
+            }
+            
+            # 保存结果到当前目录的result.json文件，供自动化脚本读取
+            result_path = "result.json"
+            with open(result_path, 'w') as f:
+                json.dump(result_data, f, indent=2)
+            print(f"测试结果已保存至 {result_path}")
+        else:
+            # 非LDL模式下，使用原有逻辑
+            test_acc, plm_acc = self.evaluate(self.args.diff_epochs, self.test_dataloader)
+        
         print(f"PLM test acc: {plm_acc}, Denoising test acc: {test_acc}")
             
             
