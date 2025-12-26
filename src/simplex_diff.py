@@ -216,9 +216,24 @@ class SimplexDiffusion(nn.Module):
 
     
     def forward_t(self, y, w, x_embed, noisy_y):
-        noisy_labels = torch.argmax(y, dim=-1)
-        simplex_y = convert_to_simplex(noisy_labels, self.simplex_value, self.num_classes)
-        simplex_noisy_y = convert_to_simplex(noisy_y, self.simplex_value, self.num_classes)
+        # 检查y是否是连续标签分布
+        if y.dim() > 1 and y.size(-1) == self.num_classes and y.dtype in [torch.float32, torch.float64]:
+            # 连续标签分布，直接使用
+            simplex_y = convert_to_simplex(y, self.simplex_value, self.num_classes)
+            noisy_labels = torch.argmax(y, dim=-1)  # 用于计算损失
+        else:
+            # 离散标签，转换为one-hot
+            noisy_labels = torch.argmax(y, dim=-1) if y.dim() > 1 else y
+            simplex_y = convert_to_simplex(noisy_labels, self.simplex_value, self.num_classes)
+        
+        # 处理noisy_y
+        if noisy_y.dim() > 1 and noisy_y.size(-1) == self.num_classes:
+            # 连续标签分布，直接使用
+            simplex_noisy_y = convert_to_simplex(noisy_y, self.simplex_value, self.num_classes)
+        else:
+            # 离散标签，转换为one-hot
+            simplex_noisy_y = convert_to_simplex(noisy_y.long(), self.simplex_value, self.num_classes)
+        
         noise = self.simplex_value * torch.randn(simplex_y.shape, device=simplex_y.device, dtype=simplex_y.dtype)
 
         batch_size = simplex_y.size(0)
@@ -240,7 +255,14 @@ class SimplexDiffusion(nn.Module):
     def reverse_t(self, y, w, x_embed, generator):
         simplex_shape = (w.size(0), self.num_classes)
         simplex = self.simplex_value * torch.randn(simplex_shape, generator=generator, device=self.args.device)
-        simplex_y = convert_to_simplex(y.long(), self.simplex_value, self.num_classes)
+        
+        # 处理y，支持连续标签分布
+        if y.dim() > 1 and y.size(-1) == self.num_classes:
+            # 连续标签分布，直接使用
+            simplex_y = convert_to_simplex(y, self.simplex_value, self.num_classes)
+        else:
+            # 离散标签，转换为one-hot
+            simplex_y = convert_to_simplex(y.long(), self.simplex_value, self.num_classes)
 
         logits_projection_fct = lambda x: logits_projection(
             x, self.simplex_value
