@@ -11,9 +11,30 @@ from math import inf
 from scipy import stats
 from utils import random_label_assign
 from transformers import BertTokenizer
-from keras.preprocessing.sequence import pad_sequences
 from torch.utils.data import TensorDataset, DataLoader, SequentialSampler
 from sentence_transformers import SentenceTransformer
+
+
+def pad_sequences(sequences, maxlen, dtype="long", truncating="post", padding="post"):
+    """Custom implementation of pad_sequences to avoid keras/tensorflow dependency"""
+    # Create array of zeros with shape (len(sequences), maxlen)
+    result = np.zeros((len(sequences), maxlen), dtype=dtype)
+    
+    for i, seq in enumerate(sequences):
+        # Truncate if sequence is longer than maxlen
+        if len(seq) > maxlen:
+            if truncating == "post":
+                seq = seq[:maxlen]
+            else:  # pre
+                seq = seq[-maxlen:]
+        
+        # Pad sequence
+        if padding == "post":
+            result[i, :len(seq)] = seq
+        else:  # pre
+            result[i, -len(seq):] = seq
+    
+    return result
 
 '''Synthetic Noises: SN, ASN, IDN'''
 def corrupt_dataset_SN(args, data):
