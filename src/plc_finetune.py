@@ -9,28 +9,93 @@ import torch.nn.functional as F
 from utils import euclidean_dist, kl_div
 
 
+class FeatureModel(nn.Module):
+    """
+    基于特征的模型类，用于LDL任务
+    直接接受feature向量作为输入，输出分类logits和embeddings
+    支持多模型分支结构
+    """
+    def __init__(self, args, feature_dim):
+        super().__init__()
+        self.args = args
+        self.feature_dim = feature_dim
+        # 映射特征到BERT隐藏层维度（768）
+        self.fc1 = nn.Linear(feature_dim, 768)
+        # 分类层
+        self.fc2 = nn.Linear(768, args.num_classes)
+        
+    def forward(self, features, labels=None):
+        # 特征映射到BERT隐藏层维度
+        embeddings = F.relu(self.fc1(features))
+        # 分类预测
+        logits = self.fc2(embeddings)
+        
+        # 模拟BERT模型的输出结构，确保兼容性
+        # BERT模型输出：(loss, logits, hidden_states, attentions)
+        if labels is not None:
+            loss = F.cross_entropy(logits, labels)
+            return (loss, logits, (None, None, None, embeddings.unsqueeze(0)))  # 保持输出结构一致
+        else:
+            return (None, logits, (None, None, None, embeddings.unsqueeze(0)))  # 保持输出结构一致
+
+
 class NLLModel(nn.Module):
-    def __init__(self, args):
+    def __init__(self, args, feature_dim=None):
+        """
+        初始化NLLModel
+        
+        Args:
+            args: 配置参数
+            feature_dim: 特征维度，如果提供则使用FeatureModel，否则使用BERT模型
+        """
         super().__init__()
         num_labels = args.num_classes
         self.args = args
         self.models = nn.ModuleList()
         self.loss_fnt = nn.CrossEntropyLoss()
+        self.use_feature = feature_dim is not None  # 是否使用feature输入
+        
         for _ in range(args.num_model):
-            model = BertForSequenceClassification.from_pretrained(args.plc, num_labels=num_labels, output_hidden_states=True)
+            if self.use_feature:
+                # 使用基于Feature的模型
+                model = FeatureModel(args, feature_dim)
+            else:
+                # 使用原始BERT模型
+                model = BertForSequenceClassification.from_pretrained(args.plc, num_labels=num_labels, output_hidden_states=True)
             model.to(self.args.device)
             self.models.append(model)
 
-    def forward(self, input_ids, attention_mask, labels=None):
+    def forward(self, input_ids, attention_mask=None, features=None, labels=None):
+        """
+        前向传播方法，支持feature输入
+        
+        Args:
+            input_ids: 文本输入的input_ids（仅BERT模型使用）
+            attention_mask: 文本输入的attention_mask（仅BERT模型使用）
+            features: 特征输入（仅FeatureModel使用）
+            labels: 标签
+        
+        Returns:
+            模型输出
+        """
         num_models = len(self.models)
         outputs = []
+        
         for i in range(num_models):
-            output = self.models[i](
-                input_ids=input_ids.to(self.args.device),
-                attention_mask=attention_mask.to(self.args.device),
-                labels=labels.to(self.args.device) if labels is not None else None,
-                return_dict=False,
-            )
+            if self.use_feature:
+                # 使用FeatureModel，输入features
+                output = self.models[i](
+                    features=features.to(self.args.device),
+                    labels=labels.to(self.args.device) if labels is not None else None
+                )
+            else:
+                # 使用BERT模型，输入input_ids和attention_mask
+                output = self.models[i](
+                    input_ids=input_ids.to(self.args.device),
+                    attention_mask=attention_mask.to(self.args.device),
+                    labels=labels.to(self.args.device) if labels is not None else None,
+                    return_dict=False,
+                )
             outputs.append(output)
 
         model_output = outputs
@@ -50,13 +115,25 @@ def accurate_nb(preds, labels):
     return np.sum(pred_flat == labels_flat)
 
 class PLC_Trainer(nn.Module):
-    def __init__(self, args, train_dataloader, valid_dataloader, test_dataloader):
+    def __init__(self, args, train_dataloader, valid_dataloader, test_dataloader, feature_dim=None):
+        """
+        初始化PLC_Trainer
+        
+        Args:
+            args: 配置参数
+            train_dataloader: 训练数据加载器
+            valid_dataloader: 验证数据加载器
+            test_dataloader: 测试数据加载器
+            feature_dim: 特征维度，如果提供则使用FeatureModel，否则使用BERT模型
+        """
         super().__init__()
         self.args = args
         self.train_dataloader = train_dataloader
         self.valid_dataloader = valid_dataloader
         self.test_dataloader = test_dataloader
-        self.model = NLLModel(self.args)
+        self.feature_dim = feature_dim
+        self.use_feature = feature_dim is not None  # 是否使用feature输入
+        self.model = NLLModel(self.args, feature_dim)
         self.model.to(self.args.device)
 
     
@@ -85,15 +162,27 @@ class PLC_Trainer(nn.Module):
             for step, batch in enumerate(self.train_dataloader):
                 # Add batch to GPU
                 batch = tuple(t.to(self.args.device) for t in batch)
-                # Unpack the inputs from our dataloader
-                b_input_ids, b_input_mask, _, b_labels = batch
+                
+                # 根据是否使用feature，解包不同的batch数据
+                if self.use_feature:
+                    # 使用feature输入，batch结构：(features, true_labels, noisy_labels)
+                    b_features, b_true_labels, b_noisy_labels = batch
+                    # 在LDL模式下，true_labels和noisy_labels是分布，我们取最大概率的类别作为训练标签
+                    b_labels = torch.argmax(b_noisy_labels, dim=1) if b_noisy_labels.dim() > 1 else b_noisy_labels
+                else:
+                    # 使用文本输入，batch结构：(input_ids, attention_mask, true_labels, noisy_labels)
+                    b_input_ids, b_input_mask, _, b_labels = batch
 
                 if num_epochs < int(self.args.plc_epochs/10):
                     self.args.alpha_t = 0
                 else:
                     self.args.alpha_t = self.args.alpha_t
                 
-                loss_ce = self.model(b_input_ids, attention_mask=b_input_mask, labels=b_labels)
+                # 根据是否使用feature，调用model的不同参数
+                if self.use_feature:
+                    loss_ce = self.model(input_ids=None, attention_mask=None, features=b_features, labels=b_labels)
+                else:
+                    loss_ce = self.model(b_input_ids, attention_mask=b_input_mask, labels=b_labels)
                 if torch.cuda.device_count() > 1:
                     loss_ce = loss_ce.mean()
                 scaler.scale(loss_ce).backward()
@@ -104,7 +193,13 @@ class PLC_Trainer(nn.Module):
                 scheduler.step()
                 self.model.zero_grad()
                 tr_loss += loss_ce.item()
-                nb_tr_examples += b_input_ids.size(0)
+                
+                # 根据输入类型更新样本数
+                if self.use_feature:
+                    nb_tr_examples += b_features.size(0)
+                else:
+                    nb_tr_examples += b_input_ids.size(0)
+                    
                 nb_tr_steps += 1
             print("Train cross entropy loss: {}".format(tr_loss/nb_tr_steps))
             num_epochs += 1
@@ -117,19 +212,35 @@ class PLC_Trainer(nn.Module):
             train_logits = [None] * len(self.model.models)
             for batch in self.train_dataloader:
                 batch = tuple(t.to(self.args.device) for t in batch)
-                b_input_ids, b_input_mask, _, b_labels = batch
+                
+                # 根据是否使用feature，解包不同的batch数据
+                if self.use_feature:
+                    b_features, b_true_labels, b_noisy_labels = batch
+                    b_labels = torch.argmax(b_noisy_labels, dim=1) if b_noisy_labels.dim() > 1 else b_noisy_labels
+                else:
+                    b_input_ids, b_input_mask, _, b_labels = batch
+                
                 with torch.no_grad():
-                    outputs = self.model(b_input_ids, attention_mask=b_input_mask)
+                    # 根据是否使用feature，调用model的不同参数
+                    if self.use_feature:
+                        outputs = self.model(input_ids=None, attention_mask=None, features=b_features)
+                    else:
+                        outputs = self.model(b_input_ids, attention_mask=b_input_mask)
+                    
                     for idx in range(len(outputs)):
-                        logits = outputs[idx][0]
+                        # 在FeatureModel中，logits是output[1]，而在BERT模型中是output[0]
+                        logits = outputs[idx][1] if self.use_feature else outputs[idx][0]
                         if train_embeds[idx] == None:
-                            train_embeds[idx] = outputs[idx][-1][-1][:,0,:].squeeze()
+                            # 提取embeddings：在BERT中是output[-1][-1][:,0,:]，在FeatureModel中是output[-1][-1]
+                            embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
+                            train_embeds[idx] = embeddings
                             train_labels[idx] = b_labels
-                            train_logits[idx] = F.softmax(outputs[idx][0], dim=-1)
+                            train_logits[idx] = F.softmax(logits, dim=-1)
                         else:
-                            train_embeds[idx] = torch.cat((train_embeds[idx], outputs[idx][-1][-1][:,0,:].squeeze()), 0)
+                            embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
+                            train_embeds[idx] = torch.cat((train_embeds[idx], embeddings), 0)
                             train_labels[idx] = torch.cat((train_labels[idx], b_labels), 0)
-                            train_logits[idx] = torch.cat((train_logits[idx], F.softmax(outputs[idx][0], dim=-1)), 0)
+                            train_logits[idx] = torch.cat((train_logits[idx], F.softmax(logits, dim=-1)), 0)
             for idx in range(len(outputs)):
                 if train_embeds_list[idx] == None:
                     train_embeds_list[idx] = torch.zeros((self.args.plc_epochs, train_embeds[idx].shape[0], train_embeds[idx].shape[1]))
@@ -150,22 +261,42 @@ class PLC_Trainer(nn.Module):
             for batch in self.valid_dataloader:
                 # Add batch to GPU
                 batch = tuple(t.to(self.args.device) for t in batch)
-                # Unpack the inputs from our dataloader
-                b_input_ids, b_input_mask, _, b_labels = batch
+                
+                # 根据是否使用feature，解包不同的batch数据
+                if self.use_feature:
+                    # 使用feature输入，batch结构：(features, true_labels, noisy_labels)
+                    b_features, b_true_labels, b_noisy_labels = batch
+                    # 在LDL模式下，true_labels和noisy_labels是分布，我们取最大概率的类别作为训练标签
+                    b_labels = torch.argmax(b_noisy_labels, dim=1) if b_noisy_labels.dim() > 1 else b_noisy_labels
+                else:
+                    # 使用文本输入，batch结构：(input_ids, attention_mask, true_labels, noisy_labels)
+                    b_input_ids, b_input_mask, _, b_labels = batch
+                
                 # Telling the model not to compute or store gradients, saving memory and speeding up validation
                 with torch.no_grad():
-                # Forward pass, calculate logit predictions
-                    outputs = self.model(b_input_ids, attention_mask=b_input_mask)
+                    # 根据是否使用feature，调用model的不同参数
+                    if self.use_feature:
+                        outputs = self.model(input_ids=None, attention_mask=None, features=b_features)
+                    else:
+                        outputs = self.model(b_input_ids, attention_mask=b_input_mask)
+                    
                     for idx in range(len(outputs)):
+                        # 在FeatureModel中，logits是output[1]，而在BERT模型中是output[0]
+                        logits = outputs[idx][1] if self.use_feature else outputs[idx][0]
                         if eval_embeds[idx] == None:
-                            eval_embeds[idx] = outputs[idx][-1][-1][:,0,:].squeeze()
+                            # 提取embeddings：在BERT中是output[-1][-1][:,0,:]，在FeatureModel中是output[-1][-1]
+                            embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
+                            eval_embeds[idx] = embeddings
                             eval_labels[idx] = b_labels
-                            eval_logits[idx] = F.softmax(outputs[idx][0], dim=-1)
+                            eval_logits[idx] = F.softmax(logits, dim=-1)
                         else:
-                            eval_embeds[idx] = torch.cat((eval_embeds[idx], outputs[idx][-1][-1][:,0,:].squeeze()), 0)
+                            embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
+                            eval_embeds[idx] = torch.cat((eval_embeds[idx], embeddings), 0)
                             eval_labels[idx] = torch.cat((eval_labels[idx], b_labels), 0)
-                            eval_logits[idx] = torch.cat((eval_logits[idx], F.softmax(outputs[idx][0], dim=-1)), 0)
-                    logits = [output[0] for output in outputs]
+                            eval_logits[idx] = torch.cat((eval_logits[idx], F.softmax(logits, dim=-1)), 0)
+                    
+                    # 获取最后一个模型的logits用于评估
+                    logits = [output[1] if self.use_feature else output[0] for output in outputs]
                     logits = logits[-1]
                     logits_list.append(logits)
                     labels_list.append(b_labels)
@@ -205,21 +336,38 @@ class PLC_Trainer(nn.Module):
             for batch in self.test_dataloader:
                 # Add batch to GPU
                 batch = tuple(t.to(self.args.device) for t in batch)
-                # Unpack the inputs from our dataloader
-                b_input_ids, b_input_mask, b_labels = batch
+                
+                # 根据是否使用feature，解包不同的batch数据
+                if self.use_feature:
+                    # 使用feature输入，batch结构：(features, true_labels)
+                    b_features, b_true_labels = batch
+                    # 在LDL模式下，true_labels是分布，我们取最大概率的类别作为测试标签
+                    b_labels = torch.argmax(b_true_labels, dim=1) if b_true_labels.dim() > 1 else b_true_labels
+                else:
+                    # 使用文本输入，batch结构：(input_ids, input_mask, true_labels)
+                    b_input_ids, b_input_mask, b_labels = batch
+                
                 # Telling the model not to compute or store gradients, saving memory and speeding up prediction
                 with torch.no_grad():
-                    # Forward pass, calculate logit predictions
-                    # outputs = model(b_input_ids, token_type_ids=None, attention_mask=b_input_mask)
-                    outputs = self.model(b_input_ids, attention_mask=b_input_mask)
-                    logits = [output[0] for output in outputs]
+                    # 根据是否使用feature，调用model的不同参数
+                    if self.use_feature:
+                        outputs = self.model(input_ids=None, attention_mask=None, features=b_features)
+                    else:
+                        outputs = self.model(b_input_ids, attention_mask=b_input_mask)
+                    
+                    # 获取logits：在FeatureModel中是output[1]，在BERT模型中是output[0]
+                    logits = [output[1] if self.use_feature else output[0] for output in outputs]
                     logits = logits[-1] #torch.stack(logits, dim=0).mean(0)
+                    
                     for idx in range(len(outputs)):
                         if test_embeds[idx] == None:
-                            test_embeds[idx] = outputs[idx][-1][-1][:,0,:].squeeze()
+                            # 提取embeddings：在BERT中是output[-1][-1][:,0,:]，在FeatureModel中是output[-1][-1]
+                            embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
+                            test_embeds[idx] = embeddings
                             test_labels[idx] = b_labels
                         else:
-                            test_embeds[idx] = torch.cat((test_embeds[idx], outputs[idx][-1][-1][:,0,:].squeeze()), 0)
+                            embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
+                            test_embeds[idx] = torch.cat((test_embeds[idx], embeddings), 0)
                             test_labels[idx] = torch.cat((test_labels[idx], b_labels), 0)
                     logits_list.append(logits)
                     labels_list.append(b_labels)
