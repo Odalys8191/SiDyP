@@ -2,7 +2,7 @@ import numpy as np
 import torch
 from torch import nn
 from tqdm import trange
-from transformers  import BertForSequenceClassification, get_linear_schedule_with_warmup
+from transformers import BertForSequenceClassification, get_linear_schedule_with_warmup
 from torch.cuda.amp import GradScaler
 import torch.nn.functional as F
 
@@ -109,10 +109,12 @@ class NLLModel(nn.Module):
             return loss
         return model_output
 
+
 def accurate_nb(preds, labels):
     pred_flat = np.argmax(preds, axis=1).flatten()
     labels_flat = labels.flatten()
     return np.sum(pred_flat == labels_flat)
+
 
 class PLC_Trainer(nn.Module):
     def __init__(self, args, train_dataloader, valid_dataloader, test_dataloader, feature_dim=None):
@@ -136,7 +138,6 @@ class PLC_Trainer(nn.Module):
         self.model = NLLModel(self.args, feature_dim)
         self.model.to(self.args.device)
 
-    
     def train(self):
         t_total = len(self.train_dataloader) * self.args.plc_epochs
         optimizer = torch.optim.Adam(self.model.parameters(), lr=self.args.plc_lr, eps=1e-9)
@@ -150,9 +151,13 @@ class PLC_Trainer(nn.Module):
         test_embeds_list = [None] * len(self.model.models)
         dists_list = [None] * len(self.model.models)
         num_epochs = 0
+        
+        # 早停机制参数
+        patience = 3  # 连续多少个epoch性能没有提升就停止
+        early_stopping_counter = 0  # 早停计数器
 
-        for epoch in trange(self.args.plc_epochs, desc="Epoch"): 
-        # Training
+        for epoch in trange(self.args.plc_epochs, desc="Epoch"):
+            # Training
             # Set our model to training mode (as opposed to evaluation mode)
             # Tracking variables
             tr_loss =  0
@@ -204,204 +209,249 @@ class PLC_Trainer(nn.Module):
             print("Train cross entropy loss: {}".format(tr_loss/nb_tr_steps))
             num_epochs += 1
 
-            # Validation
-            # Put model in evaluation mode to evaluate loss on the validation set
-            self.model.eval()
-            train_embeds = [None] * len(self.model.models)
-            train_labels = [None] * len(self.model.models)
-            train_logits = [None] * len(self.model.models)
-            for batch in self.train_dataloader:
-                batch = tuple(t.to(self.args.device) for t in batch)
-                
-                # 根据是否使用feature，解包不同的batch数据
-                if self.use_feature:
-                    b_features, b_true_labels, b_noisy_labels = batch
-                    b_labels = torch.argmax(b_noisy_labels, dim=1) if b_noisy_labels.dim() > 1 else b_noisy_labels
-                else:
-                    b_input_ids, b_input_mask, _, b_labels = batch
-                
-                with torch.no_grad():
-                    # 根据是否使用feature，调用model的不同参数
-                    if self.use_feature:
-                        outputs = self.model(input_ids=None, attention_mask=None, features=b_features)
-                    else:
-                        outputs = self.model(b_input_ids, attention_mask=b_input_mask)
-                    
-                    for idx in range(len(outputs)):
-                        # 在FeatureModel中，logits是output[1]，而在BERT模型中是output[0]
-                        logits = outputs[idx][1] if self.use_feature else outputs[idx][0]
-                        if train_embeds[idx] == None:
-                            # 提取embeddings：在BERT中是output[-1][-1][:,0,:]，在FeatureModel中是output[-1][-1]
-                            embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
-                            train_embeds[idx] = embeddings
-                            train_labels[idx] = b_labels
-                            train_logits[idx] = F.softmax(logits, dim=-1)
-                        else:
-                            embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
-                            train_embeds[idx] = torch.cat((train_embeds[idx], embeddings), 0)
-                            train_labels[idx] = torch.cat((train_labels[idx], b_labels), 0)
-                            train_logits[idx] = torch.cat((train_logits[idx], F.softmax(logits, dim=-1)), 0)
-            for idx in range(len(outputs)):
-                if train_embeds_list[idx] == None:
-                    train_embeds_list[idx] = torch.zeros((self.args.plc_epochs, train_embeds[idx].shape[0], train_embeds[idx].shape[1]))
-                    train_embeds_list[idx][0] = train_embeds[idx].detach()
-                else:
-                    train_embeds_list[idx][epoch] = train_embeds[idx].detach()
-            # Tracking variables 
-            eval_accurate_nb = 0
-            nb_eval_examples = 0
-            logits_list = []
-            labels_list = []
-
-            self.model.eval()
-            eval_embeds = [None] * len(self.model.models)
-            eval_labels = [None] * len(self.model.models)
-            eval_logits = [None] * len(self.model.models)
-            # Evaluate data for one epoch
-            for batch in self.valid_dataloader:
-                # Add batch to GPU
-                batch = tuple(t.to(self.args.device) for t in batch)
-                
-                # 根据是否使用feature，解包不同的batch数据
-                if self.use_feature:
-                    # 使用feature输入，batch结构：(features, true_labels, noisy_labels)
-                    b_features, b_true_labels, b_noisy_labels = batch
-                    # 在LDL模式下，true_labels和noisy_labels是分布，我们取最大概率的类别作为训练标签
-                    b_labels = torch.argmax(b_noisy_labels, dim=1) if b_noisy_labels.dim() > 1 else b_noisy_labels
-                else:
-                    # 使用文本输入，batch结构：(input_ids, attention_mask, true_labels, noisy_labels)
-                    b_input_ids, b_input_mask, _, b_labels = batch
-                
-                # Telling the model not to compute or store gradients, saving memory and speeding up validation
-                with torch.no_grad():
-                    # 根据是否使用feature，调用model的不同参数
-                    if self.use_feature:
-                        outputs = self.model(input_ids=None, attention_mask=None, features=b_features)
-                    else:
-                        outputs = self.model(b_input_ids, attention_mask=b_input_mask)
-                    
-                    for idx in range(len(outputs)):
-                        # 在FeatureModel中，logits是output[1]，而在BERT模型中是output[0]
-                        logits = outputs[idx][1] if self.use_feature else outputs[idx][0]
-                        if eval_embeds[idx] == None:
-                            # 提取embeddings：在BERT中是output[-1][-1][:,0,:]，在FeatureModel中是output[-1][-1]
-                            embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
-                            eval_embeds[idx] = embeddings
-                            eval_labels[idx] = b_labels
-                            eval_logits[idx] = F.softmax(logits, dim=-1)
-                        else:
-                            embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
-                            eval_embeds[idx] = torch.cat((eval_embeds[idx], embeddings), 0)
-                            eval_labels[idx] = torch.cat((eval_labels[idx], b_labels), 0)
-                            eval_logits[idx] = torch.cat((eval_logits[idx], F.softmax(logits, dim=-1)), 0)
-                    
-                    # 获取最后一个模型的logits用于评估
-                    logits = [output[1] if self.use_feature else output[0] for output in outputs]
-                    logits = logits[-1]
-                    logits_list.append(logits)
-                    labels_list.append(b_labels)
-                # Move logits and labels to CPU
-                logits = logits.detach().cpu().numpy()
-                label_ids = b_labels.to('cpu').numpy()
-
-                tmp_eval_nb = accurate_nb(logits, label_ids)
-        
-                eval_accurate_nb += tmp_eval_nb
-                nb_eval_examples += label_ids.shape[0]
-            for idx in range(len(self.model.models)):
-                if eval_embeds_list[idx] == None:
-                    eval_embeds_list[idx] = torch.zeros((self.args.plc_epochs, eval_embeds[idx].shape[0], eval_embeds[idx].shape[1]))
-                    eval_embeds_list[idx][0] = eval_embeds[idx].detach()
-                else:
-                    eval_embeds_list[idx][epoch] = eval_embeds[idx].detach()
-            eval_accuracy = eval_accurate_nb/nb_eval_examples
-            print("Validation Accuracy: {}".format(eval_accuracy))
-            scheduler.step(eval_accuracy)
-
-            if eval_accuracy > best_val:
-                best_val = eval_accuracy
-                best_model = self.model
-                
-
-            # Put model in evaluation mode
-            self.model.eval()
-            # Tracking variables 
-            eval_accurate_nb = 0
-            nb_test_examples = 0
-            logits_list = []
-            labels_list = []
-            test_embeds = [None] * len(self.model.models)
-            test_labels = [None] * len(self.model.models)
-            # Predict 
-            for batch in self.test_dataloader:
-                # Add batch to GPU
-                batch = tuple(t.to(self.args.device) for t in batch)
-                
-                # 根据是否使用feature，解包不同的batch数据
-                if self.use_feature:
-                    # 使用feature输入，batch结构：(features, true_labels)
-                    b_features, b_true_labels = batch
-                    # 在LDL模式下，true_labels是分布，我们取最大概率的类别作为测试标签
-                    b_labels = torch.argmax(b_true_labels, dim=1) if b_true_labels.dim() > 1 else b_true_labels
-                else:
-                    # 使用文本输入，batch结构：(input_ids, input_mask, true_labels)
-                    b_input_ids, b_input_mask, b_labels = batch
-                
-                # Telling the model not to compute or store gradients, saving memory and speeding up prediction
-                with torch.no_grad():
-                    # 根据是否使用feature，调用model的不同参数
-                    if self.use_feature:
-                        outputs = self.model(input_ids=None, attention_mask=None, features=b_features)
-                    else:
-                        outputs = self.model(b_input_ids, attention_mask=b_input_mask)
-                    
-                    # 获取logits：在FeatureModel中是output[1]，在BERT模型中是output[0]
-                    logits = [output[1] if self.use_feature else output[0] for output in outputs]
-                    logits = logits[-1] #torch.stack(logits, dim=0).mean(0)
-                    
-                    for idx in range(len(outputs)):
-                        if test_embeds[idx] == None:
-                            # 提取embeddings：在BERT中是output[-1][-1][:,0,:]，在FeatureModel中是output[-1][-1]
-                            embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
-                            test_embeds[idx] = embeddings
-                            test_labels[idx] = b_labels
-                        else:
-                            embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
-                            test_embeds[idx] = torch.cat((test_embeds[idx], embeddings), 0)
-                            test_labels[idx] = torch.cat((test_labels[idx], b_labels), 0)
-                    logits_list.append(logits)
-                    labels_list.append(b_labels)
-                # Move logits and labels to CPU
-                logits = logits.detach().cpu().numpy()
-                label_ids = b_labels.to('cpu').numpy()
-
-                tmp_eval_nb = accurate_nb(logits, label_ids)
-                eval_accurate_nb += tmp_eval_nb
-                nb_test_examples += label_ids.shape[0]
-            for idx in range(len(outputs)):
-                if test_embeds_list[idx] == None:
-                    test_embeds_list[idx] = torch.zeros((self.args.plc_epochs, test_embeds[idx].shape[0], test_embeds[idx].shape[1]))
-                    test_embeds_list[idx][0] = test_embeds[idx].detach()
-                else:
-                    test_embeds_list[idx][epoch] = test_embeds[idx].detach()
-
-            print("Test Accuracy: {}".format(eval_accurate_nb/nb_test_examples))
-
-            full_dists = [None] * len(self.model.models)
-            for idx in range(len(self.model.models)):
-                dists_embeds = torch.cat((train_embeds[idx], eval_embeds[idx], test_embeds[idx]), 0)
-                dists_labels = torch.cat((train_labels[idx], eval_labels[idx], test_labels[idx]), 0)
-                dists = euclidean_dist(self.args, dists_embeds, dists_labels)
-                full_dists[idx] = dists
-                dists = [dists[i][dists_labels[i]] for i in range(len(dists))]
-                dists_epochs.append(dists)
+            # 减少验证和测试频率，只在特定条件下执行
+            # 1. warmup结束后执行一次
+            # 2. 最后3个epoch每个都执行
+            # 3. 总训练epoch数较少时（<=5），每个epoch都执行
+            should_evaluate = False
+            warmup_epochs = 0.06  # 与scheduler中的warmup_steps对应
+            if epoch == int(warmup_epochs * self.args.plc_epochs):
+                should_evaluate = True  # warmup结束后执行一次
+            elif epoch >= self.args.plc_epochs - 3:
+                should_evaluate = True  # 最后3个epoch每个都执行
+            elif self.args.plc_epochs <= 5:
+                should_evaluate = True  # 总epoch数较少时，每个epoch都执行
             
-                if dists_list[idx] is None:
-                    dists_list[idx] = torch.zeros((self.args.plc_epochs, full_dists[idx].shape[0], full_dists[idx].shape[1]))
-                    dists_list[idx][0] = full_dists[idx].detach()
-                else:
-                    dists_list[idx][epoch] = full_dists[idx].detach()
+            if should_evaluate:
+                # Validation
+                # Put model in evaluation mode to evaluate loss on the validation set
+                self.model.eval()
+                train_embeds = [None] * len(self.model.models)
+                train_labels = [None] * len(self.model.models)
+                train_logits = [None] * len(self.model.models)
+                for batch in self.train_dataloader:
+                    batch = tuple(t.to(self.args.device) for t in batch)
+                    
+                    # 根据是否使用feature，解包不同的batch数据
+                    if self.use_feature:
+                        b_features, b_true_labels, b_noisy_labels = batch
+                        b_labels = torch.argmax(b_noisy_labels, dim=1) if b_noisy_labels.dim() > 1 else b_noisy_labels
+                    else:
+                        b_input_ids, b_input_mask, _, b_labels = batch
+                    
+                    with torch.no_grad():
+                        # 根据是否使用feature，调用model的不同参数
+                        if self.use_feature:
+                            outputs = self.model(input_ids=None, attention_mask=None, features=b_features)
+                        else:
+                            outputs = self.model(b_input_ids, attention_mask=b_input_mask)
+                        
+                        for idx in range(len(outputs)):
+                            # 在FeatureModel中，logits是output[1]，而在BERT模型中是output[0]
+                            logits = outputs[idx][1] if self.use_feature else outputs[idx][0]
+                            if train_embeds[idx] == None:
+                                # 提取embeddings：在BERT中是output[-1][-1][:,0,:]，在FeatureModel中是output[-1][-1]
+                                embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
+                                train_embeds[idx] = embeddings
+                                train_labels[idx] = b_labels
+                                train_logits[idx] = F.softmax(logits, dim=-1)
+                            else:
+                                embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
+                                train_embeds[idx] = torch.cat((train_embeds[idx], embeddings), 0)
+                                train_labels[idx] = torch.cat((train_labels[idx], b_labels), 0)
+                                train_logits[idx] = torch.cat((train_logits[idx], F.softmax(logits, dim=-1)), 0)
+                for idx in range(len(outputs)):
+                    if train_embeds_list[idx] == None:
+                        train_embeds_list[idx] = torch.zeros((self.args.plc_epochs, train_embeds[idx].shape[0], train_embeds[idx].shape[1]))
+                        train_embeds_list[idx][0] = train_embeds[idx].detach()
+                    else:
+                        train_embeds_list[idx][epoch] = train_embeds[idx].detach()
+                # Tracking variables 
+                eval_accurate_nb = 0
+                nb_eval_examples = 0
+                logits_list = []
+                labels_list = []
 
+                self.model.eval()
+                eval_embeds = [None] * len(self.model.models)
+                eval_labels = [None] * len(self.model.models)
+                eval_logits = [None] * len(self.model.models)
+                # Evaluate data for one epoch
+                for batch in self.valid_dataloader:
+                    # Add batch to GPU
+                    batch = tuple(t.to(self.args.device) for t in batch)
+                    
+                    # 根据是否使用feature，解包不同的batch数据
+                    if self.use_feature:
+                        # 使用feature输入，batch结构：(features, true_labels, noisy_labels)
+                        b_features, b_true_labels, b_noisy_labels = batch
+                        # 在LDL模式下，true_labels和noisy_labels是分布，我们取最大概率的类别作为训练标签
+                        b_labels = torch.argmax(b_noisy_labels, dim=1) if b_noisy_labels.dim() > 1 else b_noisy_labels
+                    else:
+                        # 使用文本输入，batch结构：(input_ids, attention_mask, true_labels, noisy_labels)
+                        b_input_ids, b_input_mask, _, b_labels = batch
+                    
+                    # Telling the model not to compute or store gradients, saving memory and speeding up validation
+                    with torch.no_grad():
+                        # 根据是否使用feature，调用model的不同参数
+                        if self.use_feature:
+                            outputs = self.model(input_ids=None, attention_mask=None, features=b_features)
+                        else:
+                            outputs = self.model(b_input_ids, attention_mask=b_input_mask)
+                        
+                        for idx in range(len(outputs)):
+                            # 在FeatureModel中，logits是output[1]，而在BERT模型中是output[0]
+                            logits = outputs[idx][1] if self.use_feature else outputs[idx][0]
+                            if eval_embeds[idx] == None:
+                                # 提取embeddings：在BERT中是output[-1][-1][:,0,:]，在FeatureModel中是output[-1][-1]
+                                embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
+                                eval_embeds[idx] = embeddings
+                                eval_labels[idx] = b_labels
+                                eval_logits[idx] = F.softmax(logits, dim=-1)
+                            else:
+                                embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
+                                eval_embeds[idx] = torch.cat((eval_embeds[idx], embeddings), 0)
+                                eval_labels[idx] = torch.cat((eval_labels[idx], b_labels), 0)
+                                eval_logits[idx] = torch.cat((eval_logits[idx], F.softmax(logits, dim=-1)), 0)
+                        
+                        # 获取最后一个模型的logits用于评估
+                        logits = [output[1] if self.use_feature else output[0] for output in outputs]
+                        logits = logits[-1]
+                        logits_list.append(logits)
+                        labels_list.append(b_labels)
+                    # Move logits and labels to CPU
+                    logits = logits.detach().cpu().numpy()
+                    label_ids = b_labels.to('cpu').numpy()
+
+                    tmp_eval_nb = accurate_nb(logits, label_ids)
+            
+                    eval_accurate_nb += tmp_eval_nb
+                    nb_eval_examples += label_ids.shape[0]
+                for idx in range(len(self.model.models)):
+                    if eval_embeds_list[idx] == None:
+                        eval_embeds_list[idx] = torch.zeros((self.args.plc_epochs, eval_embeds[idx].shape[0], eval_embeds[idx].shape[1]))
+                        eval_embeds_list[idx][0] = eval_embeds[idx].detach()
+                    else:
+                        eval_embeds_list[idx][epoch] = eval_embeds[idx].detach()
+                eval_accuracy = eval_accurate_nb/nb_eval_examples
+                print("Validation Accuracy: {}".format(eval_accuracy))
+                scheduler.step(eval_accuracy)
+
+                if eval_accuracy > best_val:
+                    best_val = eval_accuracy
+                    best_model = self.model
+                    early_stopping_counter = 0  # 性能提升，重置早停计数器
+                    print("Epoch {}: 验证准确率提升至 {:.4f}，重置早停计数器".format(epoch, eval_accuracy))
+                else:
+                    early_stopping_counter += 1  # 性能未提升，增加早停计数器
+                    print("Epoch {}: 验证准确率未提升，早停计数器: {}/{}".format(epoch, early_stopping_counter, patience))
+                
+                # 检查是否触发早停
+                if early_stopping_counter >= patience:
+                    print("早停机制触发：连续 {} 个epoch验证准确率未提升，提前终止训练".format(patience))
+                    # 跳出epoch循环，提前结束训练
+                    break
+
+                # Put model in evaluation mode
+                self.model.eval()
+                # Tracking variables 
+                eval_accurate_nb = 0
+                nb_test_examples = 0
+                logits_list = []
+                labels_list = []
+                test_embeds = [None] * len(self.model.models)
+                test_labels = [None] * len(self.model.models)
+                # Predict 
+                for batch in self.test_dataloader:
+                    # Add batch to GPU
+                    batch = tuple(t.to(self.args.device) for t in batch)
+                    
+                    # 根据是否使用feature，解包不同的batch数据
+                    if self.use_feature:
+                        # 使用feature输入，batch结构：(features, true_labels)
+                        b_features, b_true_labels = batch
+                        # 在LDL模式下，true_labels是分布，我们取最大概率的类别作为测试标签
+                        b_labels = torch.argmax(b_true_labels, dim=1) if b_true_labels.dim() > 1 else b_true_labels
+                    else:
+                        # 使用文本输入，batch结构：(input_ids, input_mask, true_labels)
+                        b_input_ids, b_input_mask, b_labels = batch
+                    
+                    # Telling the model not to compute or store gradients, saving memory and speeding up prediction
+                    with torch.no_grad():
+                        # 根据是否使用feature，调用model的不同参数
+                        if self.use_feature:
+                            outputs = self.model(input_ids=None, attention_mask=None, features=b_features)
+                        else:
+                            outputs = self.model(b_input_ids, attention_mask=b_input_mask)
+                        
+                        # 获取logits：在FeatureModel中是output[1]，在BERT模型中是output[0]
+                        logits = [output[1] if self.use_feature else output[0] for output in outputs]
+                        logits = logits[-1] #torch.stack(logits, dim=0).mean(0)
+                        
+                        for idx in range(len(outputs)):
+                            if test_embeds[idx] == None:
+                                # 提取embeddings：在BERT中是output[-1][-1][:,0,:]，在FeatureModel中是output[-1][-1]
+                                embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
+                                test_embeds[idx] = embeddings
+                                test_labels[idx] = b_labels
+                            else:
+                                embeddings = outputs[idx][-1][-1][:,0,:].squeeze() if not self.use_feature else outputs[idx][-1][-1].squeeze()
+                                test_embeds[idx] = torch.cat((test_embeds[idx], embeddings), 0)
+                                test_labels[idx] = torch.cat((test_labels[idx], b_labels), 0)
+                        logits_list.append(logits)
+                        labels_list.append(b_labels)
+                    # Move logits and labels to CPU
+                    logits = logits.detach().cpu().numpy()
+                    label_ids = b_labels.to('cpu').numpy()
+
+                    tmp_eval_nb = accurate_nb(logits, label_ids)
+                    eval_accurate_nb += tmp_eval_nb
+                    nb_test_examples += label_ids.shape[0]
+                for idx in range(len(outputs)):
+                    if test_embeds_list[idx] == None:
+                        test_embeds_list[idx] = torch.zeros((self.args.plc_epochs, test_embeds[idx].shape[0], test_embeds[idx].shape[1]))
+                        test_embeds_list[idx][0] = test_embeds[idx].detach()
+                    else:
+                        test_embeds_list[idx][epoch] = test_embeds[idx].detach()
+
+                print("Test Accuracy: {}".format(eval_accurate_nb/nb_test_examples))
+
+                full_dists = [None] * len(self.model.models)
+                for idx in range(len(self.model.models)):
+                    dists_embeds = torch.cat((train_embeds[idx], eval_embeds[idx], test_embeds[idx]), 0)
+                    dists_labels = torch.cat((train_labels[idx], eval_labels[idx], test_labels[idx]), 0)
+                    dists = euclidean_dist(self.args, dists_embeds, dists_labels)
+                    full_dists[idx] = dists
+                    dists = [dists[i][dists_labels[i]] for i in range(len(dists))]
+                    dists_epochs.append(dists)
+                
+                    if dists_list[idx] is None:
+                        dists_list[idx] = torch.zeros((self.args.plc_epochs, full_dists[idx].shape[0], full_dists[idx].shape[1]))
+                        dists_list[idx][0] = full_dists[idx].detach()
+                    else:
+                        dists_list[idx][epoch] = full_dists[idx].detach()
+            else:
+                # 不执行完整验证时，只更新scheduler
+                scheduler.step()
+                print("Epoch {}: 跳过验证和测试，仅更新学习率".format(epoch))
+
+        # 训练结束后保存最终模型权重
+        import os
+        # 创建模型保存目录
+        if hasattr(self.args, 'dataset_path'):
+            # LDL模式
+            model_save_dir = os.path.join("./best_models", "plc", os.path.basename(self.args.dataset_path), str(self.args.seed))
+        else:
+            # 非LDL模式
+            model_save_dir = os.path.join("./best_models", "plc", self.args.dataset, str(self.args.seed))
+        os.makedirs(model_save_dir, exist_ok=True)
+        final_model_save_path = os.path.join(model_save_dir, 'final_plc_model.pt')
+        torch.save({
+            'model_state_dict': self.model.state_dict(),
+            'best_val': best_val
+        }, final_model_save_path)
+        print(f"PLC模型最终权重已保存到: {final_model_save_path}")
+        
         train_embeds_list = torch.stack(train_embeds_list, dim=0)
         eval_embeds_list = torch.stack(eval_embeds_list, dim=0)
         test_embeds_list = torch.stack(test_embeds_list, dim=0)
