@@ -54,8 +54,8 @@ class Simplex_Trainer:
         self.optimizer = Adam(self.simplex_diffs.parameters(), lr=self.args.diff_lr, \
                             weight_decay=0.0, betas=(0.9, 0.999), amsgrad=False, eps=1e-08)
 
-        # 设置模型保存路径
-        self.model_path = "/storage/home/hcoda1/7/lye48/p-schava6-0/weak_supervision/SiDyP/best_models/"
+        # 设置模型保存路径（使用相对路径）
+        self.model_path = "./best_models/"
         if self.args.noise_type == "llm":
             self.model_path += f"{self.args.noise_type}/{self.args.prompt_type}/{self.args.llm_type}/{self.args.dataset}/{self.args.seed}"
         elif self.args.noise_type == "realworld":
@@ -126,7 +126,8 @@ class Simplex_Trainer:
 
                 total_diff_loss = 0.0
                 total_reg_loss = 0.0
-                prob_list = torch.zeros(self.args.num_model, n, self.args.num_classes)
+                # 使用torch.zeros_like或更高效的方式初始化prob_list
+                prob_list = torch.zeros(self.args.num_model, n, self.args.num_classes, device=self.args.device)
 
                 for model_i in range(self.args.num_model):
                     y_model = y[:, model_i, :]
@@ -141,7 +142,7 @@ class Simplex_Trainer:
                     if uncertain_idx.numel() != 0 and (epoch >= self.args.warmup_epochs*self.args.diff_epochs):
                         uncertain_y_batch = y_model[uncertain_idx]
 
-                        # filter ourt pad value -1
+                        # filter out pad value -1
                         uncertain_y_batch = [y[y!=-1] for y in uncertain_y_batch]
 
                         uncertain_weights_batch = weights_model[uncertain_idx]
@@ -163,6 +164,9 @@ class Simplex_Trainer:
                             for (i, idx) in enumerate(uncertain_idx):
                                 pred_y = pred_labels[i]
                                 true_uncertain_y = true_labels[idx]
+                                # 如果true_uncertain_y是向量（LDL模式），则转换为类别索引
+                                if true_uncertain_y.ndim > 0:
+                                    true_uncertain_y = torch.argmax(true_uncertain_y)
                                 if pred_y == true_uncertain_y:
                                     correct_uncertain += 1
                                 uncertain_y = uncertain_y_batch[i].clone().detach()
@@ -201,7 +205,7 @@ class Simplex_Trainer:
                         weights_model = torch.tensor([weights_model[i, current_y_model[i]] for i in range(weights_model.size(0))], device=self.args.device)
                         current_y_model = nn.functional.one_hot(current_y_model, num_classes=self.args.num_classes)
 
-                        if epoch >= self.args.warmup_epochs*self.args.diff_epochs:                                    
+                        if epoch >= self.args.warmup_epochs*self.args.diff_epochs:                                     
                             loss, logits = self.simplex_diffs[model_i].forward_t(current_y_model, w_model, x_embed, noisy_y)
                             prob = torch.softmax(logits, dim=-1)
                             weighted_ce_loss = torch.matmul(weights_model, loss.double())
@@ -239,7 +243,15 @@ class Simplex_Trainer:
                 for model_i in range(self.args.num_model):
                     self.EMAs[model_i].update(self.simplex_diffs[model_i]._denoise_fn)
                 
-                total_loss += loss
+                total_loss += loss.item()  # 使用.item()避免梯度累积
+                
+                # 每10个batch清理一次GPU内存
+                if (step + 1) % 10 == 0:
+                    torch.cuda.empty_cache()
+            
+            # 清理不需要的张量
+            del y, weights, uncertain_markers, noisy_y, w, x_embed, prob_list
+            torch.cuda.empty_cache()
             
             return total_loss / num_steps
             
@@ -260,9 +272,30 @@ class Simplex_Trainer:
             all_inference_predictions = []
             
             for test_batch_idx, data_batch in tqdm(enumerate(eval_loader), total=len(eval_loader), desc=f'Simplex Diffusion Sampling...', ncols=100):
-                input_ids, input_mask, target, w, x_embed = data_batch 
+                # 根据数据加载器类型调整数据解析逻辑
+                if len(data_batch) == 5:
+                    # 测试集和验证集的数据结构
+                    input_ids, input_mask, target, w, x_embed = data_batch 
+                elif len(data_batch) == 7:
+                    # 训练集的数据结构
+                    w, y, weights, uncertain_markers, noisy_y, true_labels, x_embed = data_batch
+                    target = true_labels
+                    # 为了兼容原有逻辑，创建占位符
+                    input_ids = None
+                    input_mask = None
+                else:
+                    # 无法识别的数据结构，抛出错误
+                    raise ValueError(f"Unexpected data batch size: {len(data_batch)}")
+                
                 w = w.squeeze().to(self.args.device)
                 target = target.squeeze().to(self.args.device)
+                
+                # 确保target是标签分布而不是类别索引
+                if self.args.ldl:
+                    # 检查target的维度，如果是1维则转换为one-hot编码
+                    if target.dim() == 1:
+                        # 转换为one-hot编码
+                        target = F.one_hot(target.long(), num_classes=self.args.num_classes).float()
                 
                 # 保存真实标签
                 all_targets.append(target.detach().cpu().numpy())
@@ -272,7 +305,7 @@ class Simplex_Trainer:
                 
                 for inf_idx in range(num_inference):
                     # 根据是否为LDL模式决定使用哪种逻辑
-                    if not self.args.ldl and self.best_plc is not None:
+                    if not self.args.ldl and self.best_plc is not None and input_ids is not None and input_mask is not None:
                         # 原始模式下，使用best_plc生成文本的分类预测
                         outputs = self.best_plc(input_ids, attention_mask=input_mask)
                         logits = [output[0] for output in outputs]
@@ -280,7 +313,7 @@ class Simplex_Trainer:
                         avg_p_y_tilde = torch.mean(torch.stack(p_y_tilde, dim=0), 0)
                         _, plm_pred_labels = torch.max(avg_p_y_tilde, dim=-1)
                     else:
-                        # LDL模式下，直接使用均匀分布作为p_y_tilde
+                        # LDL模式下或input_ids/input_mask为None时，直接使用均匀分布作为p_y_tilde
                         # 或者可以跳过PLM预测，仅使用simplex_diffs的结果
                         # 这里使用均匀分布作为默认值，确保代码能够正常运行
                         p_y_tilde = [torch.ones((target.size(0), self.args.num_classes)) / self.args.num_classes for _ in range(self.args.num_model)]
@@ -319,8 +352,11 @@ class Simplex_Trainer:
                 
                 # 计算准确率（用于兼容原有逻辑）
                 pred_labels = np.argmax(avg_batch_pred, axis=1)
-                correct += np.sum(pred_labels == target.detach().cpu().numpy())
-                plm_correct += torch.sum(plm_pred_labels==target.detach().cpu()).item()
+                target_cpu = target.detach().cpu()
+                # 将one-hot编码的target转换为类别索引
+                target_indices = target_cpu.argmax(dim=1) if target_cpu.ndim > 1 else target_cpu
+                correct += np.sum(pred_labels == target_indices.numpy())
+                plm_correct += torch.sum(plm_pred_labels == target_indices).item()
                 all_sample += target.size(0)
 
         print(f'time cost for sampling: {time.time() - start}')
@@ -340,17 +376,59 @@ class Simplex_Trainer:
         """
         计算LDL指标
         :param predictions: 预测的标签分布 (n_samples, n_classes)
-        :param true_labels: 真实的标签分布 (n_samples, n_classes)
-        :return: 六个LDL指标值
+        :param true_labels: 真实的标签分布 (n_samples, n_classes) 或类别索引 (n_samples,)
+        :return: 六个LDL指标值和平均改进率
         """
-        # 导入ldl_metrics模块
+        # 导入ldl_metrics模块和calc_avg_imp函数
         from ldl_metrics import score, proj
+        from ldl_automation import calc_avg_imp
+        import json
+        import os
+        import numpy as np
         
         # 使用proj函数将预测分布投影到概率单纯形
         predictions_proj = proj(predictions)
         
+        # 确保true_labels是标签分布而不是类别索引
+        if true_labels.ndim == 1:
+            # 转换为one-hot编码
+            true_labels_onehot = np.zeros((true_labels.shape[0], self.args.num_classes))
+            true_labels_onehot[np.arange(true_labels.shape[0]), true_labels.astype(int)] = 1.0
+            true_labels = true_labels_onehot
+        
         # 计算六个LDL指标
         cheby, clark, can, kl, cosine, inter = score(true_labels, predictions_proj)
+        
+        # 加载SOTA数据
+        sota_data = {}
+        sota_path = "/home/ubuntu/dyp/zxj/Data/sota.json"
+        if os.path.exists(sota_path):
+            with open(sota_path, 'r') as f:
+                sota_data = json.load(f)
+        
+        # 获取当前数据集名称
+        dataset_name = os.path.basename(self.args.dataset_path) if hasattr(self.args, 'dataset_path') else 'unknown'
+        
+        # 准备我们的指标值（与calc_avg_imp函数期望的顺序一致）
+        our_metrics = [cheby, clark, can, kl, cosine, inter]
+        
+        # 准备SOTA指标值
+        sota_values = []
+        if sota_data and 'data' in sota_data:
+            if dataset_name in sota_data['data']:
+                dataset_sota = sota_data['data'][dataset_name]
+                # 定义指标顺序，确保与our_metrics的顺序一致
+                metric_order = ['Cheby', 'Clark', 'Canbe', 'KL', 'Cosine', 'Inter']
+                # 提取每个指标的mean值
+                for metric in metric_order:
+                    if metric in dataset_sota and 'mean' in dataset_sota[metric]:
+                        sota_values.append(dataset_sota[metric]['mean'])
+        
+        # 确保sota_values有6个值，如果不足则用1.0填充
+        sota_vals = sota_values[:6] + [1.0]*(6 - len(sota_values))
+        
+        # 计算平均改进率
+        improvement = calc_avg_imp(np.array(our_metrics), np.array(sota_vals))
         
         print(f"LDL Metrics:")
         print(f"  Chebyshev Distance: {cheby:.4f}")
@@ -359,15 +437,28 @@ class Simplex_Trainer:
         print(f"  KL Divergence: {kl:.4f}")
         print(f"  Cosine Similarity: {cosine:.4f}")
         print(f"  Intersection Distance: {inter:.4f}")
+        print(f"  Average Improvement: {improvement:.4f}")
         
-        return cheby, clark, can, kl, cosine, inter
+        return cheby, clark, can, kl, cosine, inter, improvement
 
     def train(self):
-        best_valid_acc = 0.0
-        print('Simplex Diffusion Training Start')
+        # 根据是否为LDL模式选择不同的最佳模型评价指标
+        if self.args.ldl:
+            best_valid_score = -float('inf')  # 改进率越高越好
+            print('Simplex Diffusion Training Start (LDL Mode)')
+        else:
+            best_valid_acc = 0.0  # 准确率越高越好
+            print('Simplex Diffusion Training Start')
+        
         for epoch in range(self.args.diff_epochs):
             train_loss = self.update_model(epoch)
+            # train_loss is already a Python float, append directly
             self.train_loss_history.append(train_loss)
+            
+            # 定期清理GPU内存，每10个epoch清理一次
+            if (epoch + 1) % 10 == 0:
+                torch.cuda.empty_cache()
+                print(f"Epoch {epoch}: 清理GPU内存")
             
             # validation - 减少simplex diffusion sampling的执行频率，只在最后几个epoch和warmup结束后执行
             # 1. warmup结束后执行一次
@@ -382,13 +473,50 @@ class Simplex_Trainer:
                 should_evaluate = True  # 总epoch数较少时，每个epoch都执行
             
             if should_evaluate:
-                valid_acc, plm_acc  = self.evaluate(epoch, self.valid_dataloader)
-                if valid_acc > best_valid_acc:
-                    print("Model Saved!")
-                    best_valid_acc = max(best_valid_acc, valid_acc)
-                    self.best_diff_model = deepcopy(self.simplex_diffs)
-                print(f"Epoch {epoch}: PLM valid acc: {plm_acc}, Denoising valid acc: {valid_acc}")
+                if self.args.ldl:
+                    try:
+                        # LDL模式下，获取验证集的预测结果并计算LDL指标和改进率
+                        valid_acc, plm_acc, predictions, true_labels = self.evaluate(epoch, self.valid_dataloader, return_predictions=True)
+                        
+                        # 计算LDL指标和改进率
+                        cheby, clark, can, kl, cosine, inter, improvement = self.compute_ldl_metrics(predictions, true_labels)
+                        
+                        # 使用改进率作为评价指标
+                        current_score = improvement
+                        print(f"Epoch {epoch}: PLM valid acc: {plm_acc}, Denoising valid acc: {valid_acc}, Improvement: {improvement:.4f}")
+                        
+                        if current_score > best_valid_score:
+                            print("Model Saved!")
+                            best_valid_score = max(best_valid_score, current_score)
+                            # 保存最佳模型时使用深拷贝，但在之后清理内存
+                            self.best_diff_model = deepcopy(self.simplex_diffs)
+                            torch.cuda.empty_cache()  # 保存模型后清理内存
+                    except Exception as e:
+                        print(f"验证过程中发生错误: {e}")
+                        print("降级使用accuracy作为备选指标")
+                        # 使用accuracy作为备选指标
+                        valid_acc, plm_acc  = self.evaluate(epoch, self.valid_dataloader)
+                        current_score = valid_acc
+                        print(f"Epoch {epoch}: PLM valid acc: {plm_acc}, Denoising valid acc: {valid_acc}")
+                        if current_score > best_valid_score:
+                            print("Model Saved!")
+                            best_valid_score = max(best_valid_score, current_score)
+                            self.best_diff_model = deepcopy(self.simplex_diffs)
+                            torch.cuda.empty_cache()
+                else:
+                    # 非LDL模式下，使用accuracy作为评价指标
+                    valid_acc, plm_acc  = self.evaluate(epoch, self.valid_dataloader)
+                    if valid_acc > best_valid_acc:
+                        print("Model Saved!")
+                        best_valid_acc = max(best_valid_acc, valid_acc)
+                        # 保存最佳模型时使用深拷贝，但在之后清理内存
+                        self.best_diff_model = deepcopy(self.simplex_diffs)
+                        torch.cuda.empty_cache()  # 保存模型后清理内存
+                    print(f"Epoch {epoch}: PLM valid acc: {plm_acc}, Denoising valid acc: {valid_acc}")
 
+        # 清理GPU内存
+        torch.cuda.empty_cache()
+        
         # 保存loss历史记录
         loss_history = {
             'train_loss': self.train_loss_history,
@@ -398,37 +526,75 @@ class Simplex_Trainer:
         with open(loss_path, 'w') as f:
             json.dump(loss_history, f, indent=2)
         
-        self.test() 
+        # 生成并保存loss曲线可视化
+        # 只在full_report模式下生成loss曲线
+        import matplotlib.pyplot as plt
+        
+        # 绘制train_loss曲线
+        plt.figure(figsize=(10, 6))
+        plt.plot(range(1, len(self.train_loss_history) + 1), self.train_loss_history, label='Train Loss')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.title('Training Loss Curve')
+        plt.legend()
+        plt.grid(True, alpha=0.3)
+        
+        # 保存loss曲线图片
+        loss_curve_path = os.path.join(self.model_path, 'loss_curve.png')
+        plt.savefig(loss_curve_path)
+        plt.close()
+        
+        print(f"Loss curve saved to: {loss_curve_path}")
+        
+        # 训练结束后保存最终模型权重
+        final_model_save_path = os.path.join(self.model_path, 'final_diff_model.pt')
+        torch.save({
+            'model_state_dict': self.simplex_diffs.state_dict(),
+            'epoch': self.args.diff_epochs,
+            'best_valid_acc': best_valid_score if self.args.ldl else best_valid_acc
+        }, final_model_save_path)
+        print(f"最终模型权重已保存到: {final_model_save_path}")
+        
+        # 清理GPU内存，准备测试
+        torch.cuda.empty_cache()
+        
+        # 调用test方法，默认生成完整报告
+        self.test(full_report=True)
     
-    def test(self):
+    def test(self, full_report=True):
         del self.simplex_diffs
         self.simplex_diffs = self.best_diff_model
 
         if self.args.ldl:
             # LDL模式下，获取预测结果并计算LDL指标
             test_acc, plm_acc, predictions, true_labels = self.evaluate(self.args.diff_epochs, self.test_dataloader, return_predictions=True)
-            # 计算LDL指标
-            cheby, clark, can, kl, cosine, inter = self.compute_ldl_metrics(predictions, true_labels)
             
-            # 保存测试结果到JSON文件
-            result_data = {
-                'metrics': {
-                    'chebyshev': float(cheby),
-                    'clark': float(clark),
-                    'canberra': float(can),
-                    'kl_div': float(kl),
-                    'cosine_similarity': float(cosine),
-                    'intersection': float(inter),
-                    'test_acc': float(test_acc),
-                    'plm_acc': float(plm_acc)
+            if full_report:
+                # 计算LDL指标和平均改进率
+                cheby, clark, can, kl, cosine, inter, improvement = self.compute_ldl_metrics(predictions, true_labels)
+                
+                # 保存测试结果到JSON文件
+                result_data = {
+                    'metrics': {
+                        'chebyshev': float(cheby),
+                        'clark': float(clark),
+                        'canberra': float(can),
+                        'kl_div': float(kl),
+                        'cosine_similarity': float(cosine),
+                        'intersection': float(inter),
+                        'test_acc': float(test_acc),
+                        'plm_acc': float(plm_acc),
+                        'improvement': float(improvement)
+                    }
                 }
-            }
-            
-            # 保存结果到当前目录的result.json文件，供自动化脚本读取
-            result_path = "result.json"
-            with open(result_path, 'w') as f:
-                json.dump(result_data, f, indent=2)
-            print(f"测试结果已保存至 {result_path}")
+                
+                # 保存结果到当前目录的result.json文件，供自动化脚本读取
+                result_path = "result.json"
+                with open(result_path, 'w') as f:
+                    json.dump(result_data, f, indent=2)
+                print(f"测试结果已保存至 {result_path}")
+            else:
+                print(f"LDL模式测试：PLM acc: {plm_acc}, Denoising acc: {test_acc}")
         else:
             # 非LDL模式下，使用原有逻辑
             test_acc, plm_acc = self.evaluate(self.args.diff_epochs, self.test_dataloader)
