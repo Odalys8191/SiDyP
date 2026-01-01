@@ -101,8 +101,14 @@ class Simplex_Trainer:
         train_sampler = SequentialSampler(self.train_dataset)
         train_loader = DataLoader(self.train_dataset, sampler=train_sampler, batch_size=self.args.train_batch_size)
 
-        if epoch <= self.args.warmup_epochs*self.args.diff_epochs:
+        # 平滑引入正则化损失
+        warmup_end = self.args.warmup_epochs * self.args.diff_epochs
+        transition_epochs = 10  # 过渡时期，可根据需要调整
+        if epoch <= warmup_end:
             self.lambda_t = 0
+        elif epoch <= warmup_end + transition_epochs:
+            # 从0到args.lambda_t线性增长
+            self.lambda_t = self.args.lambda_t * (epoch - warmup_end) / transition_epochs
         else:
             self.lambda_t = self.args.lambda_t
         
@@ -217,7 +223,6 @@ class Simplex_Trainer:
                             prob = torch.softmax(logits, dim=-1)
                             weighted_ce_loss = torch.matmul(weights_model[certain_idx], loss.double())
                             diff_loss = torch.mean(weighted_ce_loss)
-                            diff_loss = torch.mean(loss)
                     
                     total_diff_loss += diff_loss
                 
@@ -237,7 +242,7 @@ class Simplex_Trainer:
                 
                 self.optimizer.zero_grad()
                 loss.backward()
-                torch.nn.utils.clip_grad_norm_(self.simplex_diffs[model_i].parameters(), 1.0)
+                torch.nn.utils.clip_grad_norm_(self.simplex_diffs.parameters(), 1.0)
                 self.optimizer.step()
 
                 for model_i in range(self.args.num_model):
@@ -401,10 +406,12 @@ class Simplex_Trainer:
         
         # 加载SOTA数据
         sota_data = {}
-        sota_path = "/home/ubuntu/dyp/zxj/Data/sota.json"
-        if os.path.exists(sota_path):
+        sota_path = self.args.sota_json if hasattr(self.args, 'sota_json') and self.args.sota_json is not None else None
+        if sota_path and os.path.exists(sota_path):
             with open(sota_path, 'r') as f:
                 sota_data = json.load(f)
+        elif sota_path and not os.path.exists(sota_path):
+            print(f"警告：SOTA JSON文件路径 {sota_path} 不存在")
         
         # 获取当前数据集名称
         dataset_name = os.path.basename(self.args.dataset_path) if hasattr(self.args, 'dataset_path') else 'unknown'
@@ -431,13 +438,13 @@ class Simplex_Trainer:
         improvement = calc_avg_imp(np.array(our_metrics), np.array(sota_vals))
         
         print(f"LDL Metrics:")
-        print(f"  Chebyshev Distance: {cheby:.4f}")
-        print(f"  Clark Distance: {clark:.4f}")
-        print(f"  Canberra Distance: {can:.4f}")
-        print(f"  KL Divergence: {kl:.4f}")
-        print(f"  Cosine Similarity: {cosine:.4f}")
-        print(f"  Intersection Distance: {inter:.4f}")
-        print(f"  Average Improvement: {improvement:.4f}")
+        print(f"  Chebyshev Distance: {cheby}")
+        print(f"  Clark Distance: {clark}")
+        print(f"  Canberra Distance: {can}")
+        print(f"  KL Divergence: {kl}")
+        print(f"  Cosine Similarity: {cosine}")
+        print(f"  Intersection Distance: {inter}")
+        print(f"  Average Improvement: {improvement}")
         
         return cheby, clark, can, kl, cosine, inter, improvement
 
