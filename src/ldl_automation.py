@@ -60,6 +60,7 @@ def parse_args():
     parser.add_argument("--evaluate", action="store_true", help="仅执行模型评估")
     parser.add_argument("--seed", default=0, type=int, help="基础随机种子")
     parser.add_argument("--output_dir", default="./ldl_results", type=str, help="结果输出目录")
+    parser.add_argument("--sota_json", default=None, type=str, help="Path to SOTA JSON file")
     return parser.parse_args()
 
 
@@ -94,8 +95,8 @@ class LDLAutomation:
             'ldl': True,
             'plc_lr': 5e-5,
             'eval_batch_size': 128,
-            'plc_epochs': 20,
-            'diff_epochs': 50  # 默认值，后续可以通过参数调整
+            'plc_epochs': 100,
+            'diff_epochs': 100  # 默认值，后续可以通过参数调整
         }
         
         # 加载SOTA数据
@@ -110,12 +111,16 @@ class LDLAutomation:
     
     def _load_sota_data(self) -> Dict:
         """加载SOTA数据"""
-        sota_path = "/home/u2120240739/czj/data/sota.json"
-        if os.path.exists(sota_path):
+        # 使用命令行参数传递的sota_json路径
+        sota_path = self.args.sota_json
+        if sota_path and os.path.exists(sota_path):
             with open(sota_path, 'r') as f:
                 return json.load(f)
+        elif sota_path and not os.path.exists(sota_path):
+            print(f"警告：SOTA数据文件 {sota_path} 不存在")
+            return {}
         else:
-            print(f"警告：未找到SOTA数据文件 {sota_path}")
+            print("未指定SOTA JSON文件路径，将不使用SOTA数据进行比较")
             return {}
     
     def _get_run_path(self, run_idx: int) -> str:
