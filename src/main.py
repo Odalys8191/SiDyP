@@ -47,6 +47,11 @@ def main():
     parser.add_argument("--clip_sample", type=bool, default=False, help="Whether to clip predicted sample between -1 and 1 for numerical stability in the noise scheduler.")
     parser.add_argument("--ldl", action="store_true", help="Whether to use LDL (Label Distribution Learning) mode")
     parser.add_argument("--num_classes", type=int, default=None, help="Number of classes for LDL task")
+    # 交叉验证相关参数
+    parser.add_argument("--cv_folds", default=5, type=int, help="Number of folds for cross-validation")
+    parser.add_argument("--train_ratio", default=0.6, type=float, help="Ratio of training data in each fold")
+    # 日志相关参数
+    parser.add_argument("--sota_json", default=None, type=str, help="Path to SOTA JSON file")
 
     args = parser.parse_args()
     set_seed(args)
@@ -77,6 +82,7 @@ def main():
 
     import numpy as np
     from torch.utils.data import TensorDataset, SequentialSampler, DataLoader
+    from sklearn.model_selection import KFold
     
     if not args.ldl:
         train_data, train_sampler, train_dataloader, train_embedding, valid_data, valid_sampler, \
@@ -92,6 +98,13 @@ def main():
         test_inputs = torch.stack([test_data[idx][0] for idx in range(len(test_data))], dim=0)
         test_masks = torch.stack([test_data[idx][1] for idx in range(len(test_data))], dim=0)
         test_true_labels = torch.stack([test_data[idx][2] for idx in range(len(test_data))], dim=0)
+        # 原始模式下，不使用交叉验证
+        cv_results = run_experiment(args, train_data, train_sampler, train_dataloader, train_embedding, 
+                                    valid_data, valid_sampler, valid_dataloader, valid_embedding, 
+                                    test_data, test_sampler, test_dataloader, test_embedding, 
+                                    train_inputs, train_masks, train_true_labels, train_noisy_labels, 
+                                    valid_inputs, valid_masks, valid_true_labels, valid_noisy_labels, 
+                                    test_inputs, test_masks, test_true_labels)
     else:
         # LDL模式下加载npy文件
         print("Loading LDL dataset...")
@@ -106,64 +119,89 @@ def main():
         if args.num_classes is None:
             args.num_classes = train_labels_orig.shape[1]
         
-        # 分割训练集和验证集（支持随机划分） - 在CPU上进行
-        # 使用随机种子确保可重复性
-        indices = torch.randperm(len(train_features_orig), device='cpu')
-        train_size = int(0.8 * len(train_features_orig))
-        valid_size = len(train_features_orig) - train_size
+        # 5折交叉验证
+        kf = KFold(n_splits=args.cv_folds, shuffle=True, random_state=args.seed)
+        cv_results = []
         
-        # 随机划分训练集和验证集
-        train_indices = indices[:train_size]
-        valid_indices = indices[train_size:]
+        for fold_idx, (train_val_idx, test_idx) in enumerate(kf.split(train_features_orig)):
+            print(f"\n===== Fold {fold_idx+1}/{args.cv_folds} =====")
+            
+            # 获取当前折的训练+验证数据
+            fold_train_val_features = train_features_orig[train_val_idx]
+            fold_train_val_labels = train_labels_orig[train_val_idx]
+            
+            # 在训练+验证数据中，再次随机划分训练集(60%)和验证集(40%)
+            fold_indices = torch.randperm(len(fold_train_val_features), device='cpu')
+            train_size = int(args.train_ratio * len(fold_train_val_features))
+            valid_size = len(fold_train_val_features) - train_size
+            
+            train_indices = fold_indices[:train_size]
+            valid_indices = fold_indices[train_size:]
+            
+            # 只将需要的数据转移到GPU，减少内存占用
+            train_features = torch.tensor(fold_train_val_features[train_indices], dtype=torch.float32, device=args.device)
+            valid_features = torch.tensor(fold_train_val_features[valid_indices], dtype=torch.float32, device=args.device)
+            train_labels = torch.tensor(fold_train_val_labels[train_indices], dtype=torch.float32, device=args.device)
+            valid_labels = torch.tensor(fold_train_val_labels[valid_indices], dtype=torch.float32, device=args.device)
+            test_features = torch.tensor(test_features, dtype=torch.float32, device=args.device)
+            test_labels = torch.tensor(test_labels, dtype=torch.float32, device=args.device)
+            
+            # 在LDL模式下，真实标签和噪声标签相同（标签分布）
+            train_true_labels = train_labels
+            train_noisy_labels = train_labels
+            valid_true_labels = valid_labels
+            valid_noisy_labels = valid_labels
+            test_true_labels = test_labels
+            
+            # 为LDL模式创建必要的占位符张量
+            train_inputs = torch.zeros((train_size, 1), device=args.device)  # 占位符，实际不使用
+            train_masks = torch.ones((train_size, 1), device=args.device)    # 全1掩码，实际不使用
+            valid_inputs = torch.zeros((valid_size, 1), device=args.device)  # 占位符，实际不使用
+            valid_masks = torch.ones((valid_size, 1), device=args.device)    # 全1掩码，实际不使用
+            test_inputs = torch.zeros((len(test_features), 1), device=args.device)  # 占位符，实际不使用
+            test_masks = torch.ones((len(test_features), 1), device=args.device)    # 全1掩码，实际不使用
+            
+            # 创建数据集和数据加载器
+            # 在LDL模式下，我们直接使用特征作为embedding
+            train_embedding = train_features
+            valid_embedding = valid_features
+            test_embedding = test_features
+            
+            # 为PLC训练准备数据
+            train_data = TensorDataset(train_inputs, train_masks, train_true_labels, train_noisy_labels)
+            train_sampler = SequentialSampler(train_data)
+            train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size)
+            
+            valid_data = TensorDataset(valid_inputs, valid_masks, valid_true_labels, valid_noisy_labels)
+            valid_sampler = SequentialSampler(valid_data)
+            valid_dataloader = DataLoader(valid_data, sampler=valid_sampler, batch_size=args.eval_batch_size)
+            
+            test_data = TensorDataset(test_inputs, test_masks, test_true_labels)
+            test_sampler = SequentialSampler(test_data)
+            test_dataloader = DataLoader(test_data, sampler=test_sampler, batch_size=args.eval_batch_size)
+            
+            # 运行实验
+            fold_result = run_experiment(args, train_data, train_sampler, train_dataloader, train_embedding, 
+                                        valid_data, valid_sampler, valid_dataloader, valid_embedding, 
+                                        test_data, test_sampler, test_dataloader, test_embedding, 
+                                        train_inputs, train_masks, train_true_labels, train_noisy_labels, 
+                                        valid_inputs, valid_masks, valid_true_labels, valid_noisy_labels, 
+                                        test_inputs, test_masks, test_true_labels)
+            
+            cv_results.append(fold_result)
         
-        # 只将需要的数据转移到GPU，减少内存占用
-        train_features = torch.tensor(train_features_orig[train_indices], dtype=torch.float32, device=args.device)
-        valid_features = torch.tensor(train_features_orig[valid_indices], dtype=torch.float32, device=args.device)
-        train_labels = torch.tensor(train_labels_orig[train_indices], dtype=torch.float32, device=args.device)
-        valid_labels = torch.tensor(train_labels_orig[valid_indices], dtype=torch.float32, device=args.device)
-        test_features = torch.tensor(test_features, dtype=torch.float32, device=args.device)
-        test_labels = torch.tensor(test_labels, dtype=torch.float32, device=args.device)
-        
-        # 释放CPU内存
-        del train_features_orig, train_labels_orig
-        
-        # 在LDL模式下，真实标签和噪声标签相同（标签分布）
-        train_true_labels = train_labels
-        train_noisy_labels = train_labels
-        valid_true_labels = valid_labels
-        valid_noisy_labels = valid_labels
-        test_true_labels = test_labels
-        
-        # 为LDL模式创建必要的占位符张量
-        # 需要核实：此处是否需要创建真实的masks和inputs，或仅使用占位符
-        # 在LDL模式下，我们直接使用特征，不需要文本输入的masks
-        train_inputs = torch.zeros((train_size, 1), device=args.device)  # 占位符，实际不使用
-        train_masks = torch.ones((train_size, 1), device=args.device)    # 全1掩码，实际不使用
-        valid_inputs = torch.zeros((valid_size, 1), device=args.device)  # 占位符，实际不使用
-        valid_masks = torch.ones((valid_size, 1), device=args.device)    # 全1掩码，实际不使用
-        test_inputs = torch.zeros((len(test_features), 1), device=args.device)  # 占位符，实际不使用
-        test_masks = torch.ones((len(test_features), 1), device=args.device)    # 全1掩码，实际不使用
-        
-        # 创建数据集和数据加载器
-        # 在LDL模式下，我们直接使用特征作为embedding
-        train_embedding = train_features
-        valid_embedding = valid_features
-        test_embedding = test_features
-        
-        # 为PLC训练准备数据
-        # 需要核实：PLC训练器是否能直接处理LDL特征，经修改PLC_Trainer可以直接处理特征输入
-        train_data = TensorDataset(train_inputs, train_masks, train_true_labels, train_noisy_labels)
-        train_sampler = SequentialSampler(train_data)
-        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=args.train_batch_size)
-        
-        valid_data = TensorDataset(valid_inputs, valid_masks, valid_true_labels, valid_noisy_labels)
-        valid_sampler = SequentialSampler(valid_data)
-        valid_dataloader = DataLoader(valid_data, sampler=valid_sampler, batch_size=args.eval_batch_size)
-        
-        test_data = TensorDataset(test_inputs, test_masks, test_true_labels)
-        test_sampler = SequentialSampler(test_data)
-        test_dataloader = DataLoader(test_data, sampler=test_sampler, batch_size=args.eval_batch_size)
+        # 计算交叉验证结果的平均值
+        print("\n===== Cross-Validation Results Summary =====")
+        # 这里可以根据需要添加结果汇总逻辑
 
+def run_experiment(args, train_data, train_sampler, train_dataloader, train_embedding, 
+                   valid_data, valid_sampler, valid_dataloader, valid_embedding, 
+                   test_data, test_sampler, test_dataloader, test_embedding, 
+                   train_inputs, train_masks, train_true_labels, train_noisy_labels, 
+                   valid_inputs, valid_masks, valid_true_labels, valid_noisy_labels, 
+                   test_inputs, test_masks, test_true_labels):
+    """运行单次实验"""
+    
     print("==========================Stage I: Pre-trained Language Classifier Finetuning===========================")
     
     if not args.ldl:
@@ -176,22 +214,22 @@ def main():
         
         # 为LDL模式创建专门的数据集和数据加载器
         # 训练集：(features, true_labels, noisy_labels)
-        train_dataset = TensorDataset(train_features, train_true_labels, train_noisy_labels)
+        train_dataset = TensorDataset(train_embedding, train_true_labels, train_noisy_labels)
         train_sampler = SequentialSampler(train_dataset)
         train_dataloader_ldl = DataLoader(train_dataset, sampler=train_sampler, batch_size=args.train_batch_size)
         
         # 验证集：(features, true_labels, noisy_labels)
-        valid_dataset = TensorDataset(valid_features, valid_true_labels, valid_noisy_labels)
+        valid_dataset = TensorDataset(valid_embedding, valid_true_labels, valid_noisy_labels)
         valid_sampler = SequentialSampler(valid_dataset)
         valid_dataloader_ldl = DataLoader(valid_dataset, sampler=valid_sampler, batch_size=args.eval_batch_size)
         
         # 测试集：(features, true_labels)
-        test_dataset = TensorDataset(test_features, test_true_labels)
+        test_dataset = TensorDataset(test_embedding, test_true_labels)
         test_sampler = SequentialSampler(test_dataset)
         test_dataloader_ldl = DataLoader(test_dataset, sampler=test_sampler, batch_size=args.eval_batch_size)
         
         # 使用FeatureModel版本的PLC_Trainer
-        feature_dim = train_features.shape[1]
+        feature_dim = train_embedding.shape[1]
         plc_trainer = PLC_Trainer(args, train_dataloader_ldl, valid_dataloader_ldl, test_dataloader_ldl, feature_dim)
         z_train, z_valid, z_test, best_plc_model, dists_list = plc_trainer.train()
 
@@ -370,6 +408,10 @@ def main():
     simplex_trainer = Simplex_Trainer(args, train_dataset, valid_dataloader, test_dataloader, z_train.size(-1), best_plc_model)
     
     simplex_trainer.train()
+    
+    return None  # 可以根据需要返回实验结果
+
+
 if __name__ == "__main__": 
     # install(show_locals=False)
     main()
