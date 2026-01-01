@@ -30,14 +30,24 @@ sys.path.append(os.path.dirname(os.path.abspath(__file__)))
 # 实现平均改进率计算函数
 def calc_avg_imp(our_mean, sota_vals):
     """计算平均改进率"""
-    if not sota_vals:
+    if sota_vals.size == 0:
         return 0.0
+    
+    # 确保所有数据都是数值类型
+    our_mean = np.asarray(our_mean, dtype=np.float64)
+    sota_vals = np.asarray(sota_vals, dtype=np.float64)
+    
     imps = []
-    for i in range(4):  # 前4个越小越好
-        imps.append((sota_vals[i] - our_mean[i]) / (sota_vals[i] + 1e-12))
-    for i in range(4, 6):  # 后2个越大越好
-        imps.append((our_mean[i] - sota_vals[i]) / (sota_vals[i] + 1e-12))
-    return np.mean(imps)
+    # 确保索引不超出数组长度
+    min_length = min(len(our_mean), len(sota_vals), 6)
+    
+    for i in range(min_length):
+        if i < 4:  # 前4个越小越好
+            imps.append((sota_vals[i] - our_mean[i]) / (sota_vals[i] + 1e-12))
+        else:  # 后2个越大越好
+            imps.append((our_mean[i] - sota_vals[i]) / (sota_vals[i] + 1e-12))
+    
+    return np.mean(imps) if imps else 0.0
 
 
 def parse_args():
@@ -61,15 +71,20 @@ class LDLAutomation:
         self.dataset_root = args.dataset_root
         self.num_classes = args.num_classes
         self.base_seed = args.seed
-        self.output_dir = args.output_dir
+        
+        # 从dataset_root中提取数据集名称
+        self.dataset_name = os.path.basename(self.dataset_root)
+        
+        # 按数据集名称组织输出目录
+        self.output_dir = os.path.join(args.output_dir, self.dataset_name)
         
         # 创建输出目录
         os.makedirs(self.output_dir, exist_ok=True)
         
         # 超参数搜索空间（仅搜索diff_lr和train_batch_size）
         self.hyperparam_space = {
-            'diff_lr': [1e-3, 5e-3, 1e-2],
-            'train_batch_size': [64, 128, 256]
+            'diff_lr': [1e-3, 1e-2],
+            'train_batch_size': [128, 256]
         }
         
         # 固定超参数（使用main.py中的默认值）
@@ -79,8 +94,8 @@ class LDLAutomation:
             'ldl': True,
             'plc_lr': 5e-5,
             'eval_batch_size': 128,
-            'plc_epochs': 10,
-            'diff_epochs': 10
+            'plc_epochs': 20,
+            'diff_epochs': 50  # 默认值，后续可以通过参数调整
         }
         
         # 加载SOTA数据
@@ -89,10 +104,13 @@ class LDLAutomation:
         # 记录实验结果
         self.grid_search_results = []
         self.eval_results = []
+        
+        # 记录最优模型信息
+        self.best_models = []
     
     def _load_sota_data(self) -> Dict:
         """加载SOTA数据"""
-        sota_path = "/home/ubuntu/dyp/zxj/Data/sota.json"
+        sota_path = "/home/u2120240739/czj/data/sota.json"
         if os.path.exists(sota_path):
             with open(sota_path, 'r') as f:
                 return json.load(f)
@@ -126,9 +144,13 @@ class LDLAutomation:
         command = self._generate_command(params, run_idx)
         print(f"执行命令: {' '.join(command)}")
         
+        # 按run_idx组织实验结果目录
+        run_dir = os.path.join(self.output_dir, f"run_{run_idx}")
+        os.makedirs(run_dir, exist_ok=True)
+        
         # 创建实验结果目录
-        exp_id = f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{run_idx}"
-        exp_dir = os.path.join(self.output_dir, exp_id)
+        exp_id = f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        exp_dir = os.path.join(run_dir, exp_id)
         os.makedirs(exp_dir, exist_ok=True)
         
         # 运行命令并捕获输出
@@ -144,10 +166,13 @@ class LDLAutomation:
         
         # 解析实验结果（这里需要根据实际输出格式调整）
         # 假设main.py会生成result.json文件
-        result_path = os.path.join(exp_dir, "result.json")
+        result_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result.json")
         if os.path.exists(result_path):
             with open(result_path, 'r') as f:
                 result_data = json.load(f)
+            # 复制result.json到实验目录
+            import shutil
+            shutil.copy(result_path, exp_dir)
         else:
             # 模拟结果数据（需要根据实际情况修改）
             result_data = {
@@ -159,9 +184,33 @@ class LDLAutomation:
             }
         
         # 计算改进率
-        our_mean = list(result_data['metrics'].values())[:6]  # 假设前6个指标是需要的
-        sota_vals = list(self.sota_data.values())[:6] if self.sota_data else [1.0]*6
+        our_metrics = list(result_data['metrics'].values())
+        # 确保有6个指标值，如果不足则填充
+        our_mean = our_metrics[:6] + [1.0]*(6 - len(our_metrics))
+        
+        # 处理sota_vals，根据当前数据集获取正确的指标数据
+        sota_values = []
+        if self.sota_data and 'data' in self.sota_data:
+            # 检查当前数据集是否在sota数据中
+            if self.dataset_name in self.sota_data['data']:
+                dataset_sota = self.sota_data['data'][self.dataset_name]
+                # 定义指标顺序，确保与our_mean的顺序一致
+                metric_order = ['Cheby', 'Clark', 'Canbe', 'KL', 'Cosine', 'Inter']
+                # 提取每个指标的mean值
+                for metric in metric_order:
+                    if metric in dataset_sota and 'mean' in dataset_sota[metric]:
+                        sota_values.append(dataset_sota[metric]['mean'])
+        
+        # 确保sota_vals有6个值，如果不足则用1.0填充
+        sota_vals = sota_values[:6] + [1.0]*(6 - len(sota_values))
         imp = calc_avg_imp(np.array(our_mean), np.array(sota_vals))
+        
+        # 获取模型保存路径（根据main.py中的模型保存逻辑）
+        # 模型保存路径格式：best_models/ldl/数据集名称/种子值
+        model_save_dir = os.path.join(
+            os.path.dirname(os.path.abspath(__file__)),
+            "best_models", "ldl", self.dataset_name, str(params['seed'])
+        )
         
         # 保存实验配置和结果
         exp_result = {
@@ -170,7 +219,9 @@ class LDLAutomation:
             'run_idx': run_idx,
             'metrics': result_data['metrics'],
             'improvement': imp,
-            'log_file': log_file
+            'log_file': log_file,
+            'exp_dir': exp_dir,
+            'model_save_dir': model_save_dir
         }
         
         return exp_result, imp
@@ -185,6 +236,7 @@ class LDLAutomation:
         
         best_imp = -float('inf')
         best_params = None
+        best_run_results = []
         
         # 执行网格搜索
         for i, combo in enumerate(hyperparam_combinations):
@@ -196,6 +248,7 @@ class LDLAutomation:
             
             # 执行10次独立实验
             exp_imps = []
+            run_results = []
             for exp_idx in range(10):
                 # 使用不同的随机种子
                 exp_params = params.copy()
@@ -203,6 +256,7 @@ class LDLAutomation:
                 
                 exp_result, imp = self._run_experiment(exp_params, run_idx=0)
                 exp_imps.append(imp)
+                run_results.append(exp_result)
                 self.grid_search_results.append(exp_result)
             
             # 计算平均改进率
@@ -213,16 +267,44 @@ class LDLAutomation:
             if avg_imp > best_imp:
                 best_imp = avg_imp
                 best_params = params
+                best_run_results = run_results
                 print(f"找到更优超参数组合，改进率: {best_imp:.4f}")
         
         # 保存网格搜索结果
         self._save_grid_search_results()
+        
+        # 保存最优模型
+        self._save_best_models(best_run_results, "grid_search")
         
         print(f"\n网格搜索完成！")
         print(f"最优超参数组合: {best_params}")
         print(f"最优平均改进率: {best_imp:.4f}")
         
         return best_params
+    
+    def _save_best_models(self, run_results: List[Dict], stage: str):
+        """保存最优模型到指定位置"""
+        import shutil
+        
+        for run_idx, result in enumerate(run_results):
+            # 目标目录：数据集名称/run_i
+            target_dir = os.path.join(self.output_dir, f"run_{run_idx}")
+            os.makedirs(target_dir, exist_ok=True)
+            
+            # 检查模型目录是否存在
+            model_dir = result['model_save_dir']
+            if os.path.exists(model_dir):
+                # 复制模型文件到目标目录
+                for root, dirs, files in os.walk(model_dir):
+                    for file in files:
+                        src_file = os.path.join(root, file)
+                        dst_file = os.path.join(target_dir, file)
+                        shutil.copy2(src_file, dst_file)
+                print(f"已将最优模型从 {model_dir} 复制到 {target_dir}")
+            else:
+                print(f"警告：模型目录 {model_dir} 不存在，无法复制模型")
+        
+        print(f"{stage}阶段最优模型已保存到指定位置")
     
     def evaluate_best_params(self, best_params: Dict) -> List[Dict]:
         """使用最优超参数在所有run_i上评估"""
@@ -245,6 +327,9 @@ class LDLAutomation:
         
         # 保存评估结果
         self._save_eval_results()
+        
+        # 保存最优模型
+        self._save_best_models(eval_results, "evaluation")
         
         return eval_results
     
