@@ -96,34 +96,36 @@ def main():
         # LDL模式下加载npy文件
         print("Loading LDL dataset...")
         
-        # 加载特征和标签分布
-        train_features = np.load(f"{args.dataset_path}/train_feature.npy")
+        # 加载特征和标签分布 - 先在CPU上加载
+        train_features_orig = np.load(f"{args.dataset_path}/train_feature.npy")
         test_features = np.load(f"{args.dataset_path}/test_feature.npy")
-        train_labels = np.load(f"{args.dataset_path}/train_label.npy")
+        train_labels_orig = np.load(f"{args.dataset_path}/train_label.npy")
         test_labels = np.load(f"{args.dataset_path}/test_label.npy")
-        
-        # 转换为torch张量
-        train_features = torch.tensor(train_features, dtype=torch.float32, device=args.device)
-        test_features = torch.tensor(test_features, dtype=torch.float32, device=args.device)
-        train_labels = torch.tensor(train_labels, dtype=torch.float32, device=args.device)
-        test_labels = torch.tensor(test_labels, dtype=torch.float32, device=args.device)
         
         # 确定类别数量
         if args.num_classes is None:
-            args.num_classes = train_labels.shape[1]
+            args.num_classes = train_labels_orig.shape[1]
         
-        # 分割训练集和验证集（支持随机划分）
+        # 分割训练集和验证集（支持随机划分） - 在CPU上进行
         # 使用随机种子确保可重复性
-        indices = torch.randperm(len(train_features), device=args.device)
-        train_size = int(0.8 * len(train_features))
-        valid_size = len(train_features) - train_size
+        indices = torch.randperm(len(train_features_orig), device='cpu')
+        train_size = int(0.8 * len(train_features_orig))
+        valid_size = len(train_features_orig) - train_size
         
         # 随机划分训练集和验证集
         train_indices = indices[:train_size]
         valid_indices = indices[train_size:]
         
-        train_features, valid_features = train_features[train_indices], train_features[valid_indices]
-        train_labels, valid_labels = train_labels[train_indices], train_labels[valid_indices]
+        # 只将需要的数据转移到GPU，减少内存占用
+        train_features = torch.tensor(train_features_orig[train_indices], dtype=torch.float32, device=args.device)
+        valid_features = torch.tensor(train_features_orig[valid_indices], dtype=torch.float32, device=args.device)
+        train_labels = torch.tensor(train_labels_orig[train_indices], dtype=torch.float32, device=args.device)
+        valid_labels = torch.tensor(train_labels_orig[valid_indices], dtype=torch.float32, device=args.device)
+        test_features = torch.tensor(test_features, dtype=torch.float32, device=args.device)
+        test_labels = torch.tensor(test_labels, dtype=torch.float32, device=args.device)
+        
+        # 释放CPU内存
+        del train_features_orig, train_labels_orig
         
         # 在LDL模式下，真实标签和噪声标签相同（标签分布）
         train_true_labels = train_labels
@@ -348,7 +350,11 @@ def main():
         # LDL模式下，直接传递连续标签分布给Simplex_Trainer* （已经修改使其支持连续标签分布）
         train_dataset = TensorDataset(z_train, train_priors, train_prior_weights, train_uncertain_marker, train_noisy_labels, train_true_labels, train_embedding)
     
-    valid_dataset = TensorDataset(valid_inputs, valid_masks, valid_priors, z_valid, valid_embedding)
+    if not args.ldl:
+        valid_dataset = TensorDataset(valid_inputs, valid_masks, valid_priors, z_valid, valid_embedding)
+    else:
+        # LDL模式下，验证集包含真实标签分布
+        valid_dataset = TensorDataset(valid_inputs, valid_masks, valid_true_labels, z_valid, valid_embedding)
     valid_sampler = SequentialSampler(valid_dataset)
     valid_dataloader = DataLoader(valid_dataset, sampler=valid_sampler, batch_size=args.eval_batch_size)
 
