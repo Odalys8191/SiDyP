@@ -16,7 +16,6 @@ import os
 import sys
 import json
 import argparse
-import subprocess
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -26,6 +25,12 @@ from typing import Dict, List, Tuple
 
 # 添加当前目录到Python路径
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+
+# 直接导入main.py中的函数
+from main import run_experiment, run_cv_experiment
+from main import argparse as main_argparse
+import torch
+from torch.utils.data import TensorDataset, SequentialSampler, DataLoader
 
 # 实现平均改进率计算函数
 def calc_avg_imp(our_mean, sota_vals):
@@ -88,6 +93,15 @@ class LDLAutomation:
             'train_batch_size': [128, 256]
         }
         
+        # 阶段配置参数
+        # 搜索阶段：使用较小的epoch值加速搜索过程
+        self.search_plc_epochs = 10  # 搜索阶段的PLC训练轮数
+        self.search_diff_epochs = 10  # 搜索阶段的Diffusion训练轮数
+        
+        # 正式阶段：使用较大的epoch值确保模型充分训练
+        self.formal_plc_epochs = 100  # 正式阶段的PLC训练轮数
+        self.formal_diff_epochs = 100  # 正式阶段的Diffusion训练轮数
+        
         # 固定超参数（使用main.py中的默认值）
         self.fixed_params = {
             'seed': self.base_seed,
@@ -95,8 +109,9 @@ class LDLAutomation:
             'ldl': True,
             'plc_lr': 5e-5,
             'eval_batch_size': 128,
-            'plc_epochs': 100,
-            'diff_epochs': 100  # 默认值，后续可以通过参数调整
+            'plc_epochs': self.formal_plc_epochs,  # 默认使用正式阶段的epoch值
+            'diff_epochs': self.formal_diff_epochs,  # 默认使用正式阶段的epoch值
+            'sota_json': self.args.sota_json
         }
         
         # 加载SOTA数据
@@ -127,69 +142,189 @@ class LDLAutomation:
         """获取run_i的路径"""
         return os.path.join(self.dataset_root, f"run_{run_idx}")
     
-    def _generate_command(self, params: Dict, run_idx: int = 0) -> List[str]:
-        """生成命令行命令"""
-        command = [
-            sys.executable, "main.py",
-            "--ldl",
-            "--dataset", self._get_run_path(run_idx),
-            "--num_classes", str(params['num_classes']),
-            "--plc_lr", str(params['plc_lr']),
-            "--diff_lr", str(params['diff_lr']),
-            "--train_batch_size", str(params['train_batch_size']),
-            "--eval_batch_size", str(params['eval_batch_size']),
-            "--plc_epochs", str(params['plc_epochs']),
-            "--diff_epochs", str(params['diff_epochs']),
-            "--seed", str(params['seed'])
-        ]
-        return command
+    def _prepare_data_for_run(self, run_idx: int, params: Dict):
+        """为单个run准备数据"""
+        import numpy as np
+        from main import create_dataset
+        
+        # 创建main.py所需的args对象
+        main_args = type('Args', (), {})
+        
+        # 设置所有参数
+        for key, value in params.items():
+            setattr(main_args, key, value)
+        
+        # 设置设备
+        main_args.device = torch.device(f'cuda' if torch.cuda.is_available() else "cpu")
+        
+        # 加载数据
+        run_path = self._get_run_path(run_idx)
+        main_args.dataset_path = run_path
+        
+        # 加载特征和标签分布 - 先在CPU上加载
+        train_features_orig = np.load(f"{run_path}/train_feature.npy")
+        test_features = np.load(f"{run_path}/test_feature.npy")
+        train_labels_orig = np.load(f"{run_path}/train_label.npy")
+        test_labels = np.load(f"{run_path}/test_label.npy")
+        
+        # 确定类别数量
+        if main_args.num_classes is None:
+            main_args.num_classes = train_labels_orig.shape[1]
+        
+        # 分割训练集和验证集（8:2比例） - 在CPU上进行
+        indices = torch.randperm(len(train_features_orig), device='cpu')
+        train_size = int(0.8 * len(train_features_orig))
+        valid_size = len(train_features_orig) - train_size
+        
+        # 随机划分训练集和验证集
+        train_indices = indices[:train_size]
+        valid_indices = indices[train_size:]
+        
+        # 只将需要的数据转移到GPU，减少内存占用
+        train_features = torch.tensor(train_features_orig[train_indices], dtype=torch.float32, device=main_args.device)
+        valid_features = torch.tensor(train_features_orig[valid_indices], dtype=torch.float32, device=main_args.device)
+        train_labels = torch.tensor(train_labels_orig[train_indices], dtype=torch.float32, device=main_args.device)
+        valid_labels = torch.tensor(train_labels_orig[valid_indices], dtype=torch.float32, device=main_args.device)
+        test_features = torch.tensor(test_features, dtype=torch.float32, device=main_args.device)
+        test_labels = torch.tensor(test_labels, dtype=torch.float32, device=main_args.device)
+        
+        # 在LDL模式下，真实标签和噪声标签相同（标签分布）
+        train_true_labels = train_labels
+        train_noisy_labels = train_labels
+        valid_true_labels = valid_labels
+        valid_noisy_labels = valid_labels
+        test_true_labels = test_labels
+        
+        # 为LDL模式创建必要的占位符张量
+        train_inputs = torch.zeros((train_size, 1), device=main_args.device)  # 占位符，实际不使用
+        train_masks = torch.ones((train_size, 1), device=main_args.device)    # 全1掩码，实际不使用
+        valid_inputs = torch.zeros((valid_size, 1), device=main_args.device)  # 占位符，实际不使用
+        valid_masks = torch.ones((valid_size, 1), device=main_args.device)    # 全1掩码，实际不使用
+        test_inputs = torch.zeros((len(test_features), 1), device=main_args.device)  # 占位符，实际不使用
+        test_masks = torch.ones((len(test_features), 1), device=main_args.device)    # 全1掩码，实际不使用
+        
+        # 创建数据集和数据加载器
+        # 在LDL模式下，我们直接使用特征作为embedding
+        train_embedding = train_features
+        valid_embedding = valid_features
+        test_embedding = test_features
+        
+        # 为PLC训练准备数据
+        train_data = TensorDataset(train_inputs, train_masks, train_true_labels, train_noisy_labels)
+        train_sampler = SequentialSampler(train_data)
+        train_dataloader = DataLoader(train_data, sampler=train_sampler, batch_size=main_args.train_batch_size)
+        
+        valid_data = TensorDataset(valid_inputs, valid_masks, valid_true_labels, valid_noisy_labels)
+        valid_sampler = SequentialSampler(valid_data)
+        valid_dataloader = DataLoader(valid_data, sampler=valid_sampler, batch_size=main_args.eval_batch_size)
+        
+        test_data = TensorDataset(test_inputs, test_masks, test_true_labels)
+        test_sampler = SequentialSampler(test_data)
+        test_dataloader = DataLoader(test_data, sampler=test_sampler, batch_size=main_args.eval_batch_size)
+        
+        return main_args, train_data, train_sampler, train_dataloader, train_embedding, \
+               valid_data, valid_sampler, valid_dataloader, valid_embedding, \
+               test_data, test_sampler, test_dataloader, test_embedding, \
+               train_inputs, train_masks, train_true_labels, train_noisy_labels, \
+               valid_inputs, valid_masks, valid_true_labels, valid_noisy_labels, \
+               test_inputs, test_masks, test_true_labels
     
-    def _run_experiment(self, params: Dict, run_idx: int = 0) -> Tuple[Dict, float]:
-        """运行单次实验"""
-        command = self._generate_command(params, run_idx)
-        print(f"执行命令: {' '.join(command)}")
+    def _run_experiment(self, params: Dict, run_idx: int = 0, use_cv: bool = True) -> Tuple[Dict, float]:
+        """运行单次实验
+        
+        Args:
+            params: 超参数字典
+            run_idx: 运行索引
+            use_cv: 是否执行五折交叉验证，默认为True
+            
+        Returns:
+            exp_result: 实验结果
+            imp: 改进率
+        """
+        print(f"运行实验: run_{run_idx}, 参数: {params}, 使用五折交叉验证: {use_cv}")
         
         # 按run_idx组织实验结果目录
         run_dir = os.path.join(self.output_dir, f"run_{run_idx}")
         os.makedirs(run_dir, exist_ok=True)
         
-        # 创建实验结果目录
-        exp_id = f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
-        exp_dir = os.path.join(run_dir, exp_id)
-        os.makedirs(exp_dir, exist_ok=True)
+        # 创建main.py所需的args对象
+        main_args = type('Args', (), {})
         
-        # 运行命令并捕获输出
-        log_file = os.path.join(exp_dir, "experiment.log")
-        with open(log_file, 'w') as f:
-            result = subprocess.run(
-                command,
-                cwd=os.path.dirname(os.path.abspath(__file__)),
-                stdout=f,
-                stderr=subprocess.STDOUT,
-                text=True
-            )
+        # 设置所有参数
+        for key, value in params.items():
+            setattr(main_args, key, value)
         
-        # 解析实验结果（这里需要根据实际输出格式调整）
-        # 假设main.py会生成result.json文件
-        result_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "result.json")
-        if os.path.exists(result_path):
-            with open(result_path, 'r') as f:
-                result_data = json.load(f)
-            # 复制result.json到实验目录
-            import shutil
-            shutil.copy(result_path, exp_dir)
+        # 设置设备
+        main_args.device = torch.device(f'cuda' if torch.cuda.is_available() else "cpu")
+        
+        # 加载数据
+        run_path = self._get_run_path(run_idx)
+        main_args.dataset_path = run_path
+        
+        # 加载特征和标签分布 - 先在CPU上加载
+        train_features_orig = np.load(f"{run_path}/train_feature.npy")
+        test_features = np.load(f"{run_path}/test_feature.npy")
+        train_labels_orig = np.load(f"{run_path}/train_label.npy")
+        test_labels = np.load(f"{run_path}/test_label.npy")
+        
+        # 确定类别数量
+        if main_args.num_classes is None:
+            main_args.num_classes = train_labels_orig.shape[1]
+        
+        metrics = {}
+        
+        if use_cv:
+            # 执行五折交叉验证
+            print("执行5折交叉验证...")
+            main_args.cv_folds = 5  # 固定为5折交叉验证
+            main_args.train_ratio = 0.6  # 固定为60%训练集，40%验证集
+            
+            cv_results = run_cv_experiment(main_args, train_features_orig, train_labels_orig, test_features, test_labels)
+            
+            # 收集所有折的metrics
+            all_metrics = []
+            for fold_result in cv_results:
+                if 'metrics' in fold_result:
+                    all_metrics.append(fold_result['metrics'])
+            
+            # 计算平均metrics
+            if all_metrics:
+                metrics_df = pd.DataFrame(all_metrics)
+                avg_metrics = metrics_df.mean().to_dict()
+                metrics = avg_metrics
         else:
-            # 模拟结果数据（需要根据实际情况修改）
-            result_data = {
-                'metrics': {
-                    'loss': np.random.rand(),
-                    'accuracy': np.random.rand(),
-                    'kl_div': np.random.rand()
-                }
-            }
+            # 不执行五折交叉验证，直接运行实验
+            print("直接运行实验（不执行五折交叉验证）...")
+            
+            # 准备数据，使用_run_prepare_data_for_run方法
+            main_args, train_data, train_sampler, train_dataloader, train_embedding, \
+            valid_data, valid_sampler, valid_dataloader, valid_embedding, \
+            test_data, test_sampler, test_dataloader, test_embedding, \
+            train_inputs, train_masks, train_true_labels, train_noisy_labels, \
+            valid_inputs, valid_masks, valid_true_labels, valid_noisy_labels, \
+            test_inputs, test_masks, test_true_labels = self._prepare_data_for_run(run_idx, params)
+            
+            # 直接调用run_experiment函数
+            result = run_experiment(main_args, train_data, train_sampler, train_dataloader, train_embedding, \
+                                   valid_data, valid_sampler, valid_dataloader, valid_embedding, \
+                                   test_data, test_sampler, test_dataloader, test_embedding, \
+                                   train_inputs, train_masks, train_true_labels, train_noisy_labels, \
+                                   valid_inputs, valid_masks, valid_true_labels, valid_noisy_labels, \
+                                   test_inputs, test_masks, test_true_labels)
+            
+            # 获取metrics
+            if result and 'metrics' in result:
+                metrics = result['metrics']
         
         # 计算改进率
-        our_metrics = list(result_data['metrics'].values())
+        our_metrics = []
+        if metrics:
+            # 按顺序提取六个指标
+            metric_order = ['chebyshev', 'clark', 'canberra', 'kl_div', 'cosine_similarity', 'intersection']
+            for metric in metric_order:
+                if metric in metrics:
+                    our_metrics.append(metrics[metric])
+        
         # 确保有6个指标值，如果不足则填充
         our_mean = our_metrics[:6] + [1.0]*(6 - len(our_metrics))
         
@@ -210,7 +345,7 @@ class LDLAutomation:
         sota_vals = sota_values[:6] + [1.0]*(6 - len(sota_values))
         imp = calc_avg_imp(np.array(our_mean), np.array(sota_vals))
         
-        # 获取模型保存路径（根据main.py中的模型保存逻辑）
+        # 获取模型保存路径
         # 模型保存路径格式：best_models/ldl/数据集名称/种子值
         model_save_dir = os.path.join(
             os.path.dirname(os.path.abspath(__file__)),
@@ -218,22 +353,31 @@ class LDLAutomation:
         )
         
         # 保存实验配置和结果
+        # 添加阶段标识，区分不同阶段的结果
+        stage = "grid_search" if use_cv else "formal_experiment"
+        
         exp_result = {
-            'exp_id': exp_id,
+            'exp_id': f"exp_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
             'params': params,
             'run_idx': run_idx,
-            'metrics': result_data['metrics'],
+            'metrics': metrics,
             'improvement': imp,
-            'log_file': log_file,
-            'exp_dir': exp_dir,
-            'model_save_dir': model_save_dir
+            'exp_dir': run_dir,
+            'model_save_dir': model_save_dir,
+            'use_cv': use_cv,
+            'stage': stage
         }
         
         return exp_result, imp
     
     def grid_search(self) -> Dict:
-        """执行网格搜索"""
+        """执行网格搜索
+        
+        Returns:
+            best_params: 最优超参数组合
+        """
         print("开始网格搜索...")
+        print(f"搜索阶段配置：plc_epochs={self.search_plc_epochs}, diff_epochs={self.search_diff_epochs}")
         
         # 生成所有超参数组合
         hyperparam_combinations = list(product(*self.hyperparam_space.values()))
@@ -249,29 +393,25 @@ class LDLAutomation:
             params = dict(zip(hyperparam_names, combo))
             params.update(self.fixed_params)
             
+            # 设置搜索阶段的小epoch值，加速搜索过程
+            params['plc_epochs'] = self.search_plc_epochs
+            params['diff_epochs'] = self.search_diff_epochs
+            
             print(f"\n正在测试超参数组合 {i+1}/{len(hyperparam_combinations)}: {params}")
             
-            # 执行10次独立实验
-            exp_imps = []
-            run_results = []
-            for exp_idx in range(10):
-                # 使用不同的随机种子
-                exp_params = params.copy()
-                exp_params['seed'] = self.base_seed + exp_idx
-                
-                exp_result, imp = self._run_experiment(exp_params, run_idx=0)
-                exp_imps.append(imp)
-                run_results.append(exp_result)
-                self.grid_search_results.append(exp_result)
+            # 执行单次实验，使用base_seed作为随机种子
+            exp_result, imp = self._run_experiment(params, run_idx=0, use_cv=True)
             
-            # 计算平均改进率
-            avg_imp = np.mean(exp_imps)
-            print(f"10次实验平均改进率: {avg_imp:.4f}")
+            # 保存结果
+            run_results = [exp_result]
+            self.grid_search_results.append(exp_result)
             
-            # 更新最优超参数
-            if avg_imp > best_imp:
-                best_imp = avg_imp
-                best_params = params
+            print(f"实验改进率: {imp:.4f}")
+            
+            # 更新最优超参数，以"sota改进率"作为核心评价指标
+            if imp > best_imp:
+                best_imp = imp
+                best_params = params.copy()
                 best_run_results = run_results
                 print(f"找到更优超参数组合，改进率: {best_imp:.4f}")
         
@@ -283,7 +423,7 @@ class LDLAutomation:
         
         print(f"\n网格搜索完成！")
         print(f"最优超参数组合: {best_params}")
-        print(f"最优平均改进率: {best_imp:.4f}")
+        print(f"最优改进率: {best_imp:.4f}")
         
         return best_params
     
@@ -312,19 +452,37 @@ class LDLAutomation:
         print(f"{stage}阶段最优模型已保存到指定位置")
     
     def evaluate_best_params(self, best_params: Dict) -> List[Dict]:
-        """使用最优超参数在所有run_i上评估"""
+        """使用最优超参数在所有run_i上评估
+        
+        Args:
+            best_params: 最优超参数组合
+            
+        Returns:
+            eval_results: 评估结果列表
+        """
         print("\n开始使用最优超参数评估所有run_i...")
+        print(f"正式实验阶段配置：plc_epochs={self.formal_plc_epochs}, diff_epochs={self.formal_diff_epochs}")
         
         eval_results = []
         
+        # 使用最优超参数，修改epoch相关参数为正式阶段的大值
+        # 保持其他超参数不变，确保两阶段之间的超参数传递正确
+        eval_params = best_params.copy()
+        eval_params['plc_epochs'] = self.formal_plc_epochs
+        eval_params['diff_epochs'] = self.formal_diff_epochs
+        
+        print(f"使用的最优超参数组合: {eval_params}")
+        
+        # 针对每个run_i（包括run_0）运行实验
         for run_idx in range(10):
             print(f"\n正在评估 run_{run_idx}...")
             
             # 使用不同的随机种子
-            params = best_params.copy()
+            params = eval_params.copy()
             params['seed'] = self.base_seed + run_idx
             
-            exp_result, imp = self._run_experiment(params, run_idx=run_idx)
+            # 执行实验，不使用五折交叉验证
+            exp_result, imp = self._run_experiment(params, run_idx=run_idx, use_cv=False)
             eval_results.append(exp_result)
             self.eval_results.append(exp_result)
             
@@ -340,14 +498,22 @@ class LDLAutomation:
     
     def _save_grid_search_results(self):
         """保存网格搜索结果"""
-        result_path = os.path.join(self.output_dir, "grid_search_results.json")
+        # 为搜索阶段创建专门的结果目录
+        search_results_dir = os.path.join(self.output_dir, "grid_search")
+        os.makedirs(search_results_dir, exist_ok=True)
+        
+        result_path = os.path.join(search_results_dir, "grid_search_results.json")
         with open(result_path, 'w') as f:
             json.dump(self.grid_search_results, f, indent=2)
         print(f"网格搜索结果已保存至 {result_path}")
     
     def _save_eval_results(self):
         """保存评估结果"""
-        result_path = os.path.join(self.output_dir, "eval_results.json")
+        # 为正式实验阶段创建专门的结果目录
+        eval_results_dir = os.path.join(self.output_dir, "formal_experiment")
+        os.makedirs(eval_results_dir, exist_ok=True)
+        
+        result_path = os.path.join(eval_results_dir, "eval_results.json")
         with open(result_path, 'w') as f:
             json.dump(self.eval_results, f, indent=2)
         print(f"评估结果已保存至 {result_path}")
