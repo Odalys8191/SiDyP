@@ -566,11 +566,14 @@ class Simplex_Trainer:
         torch.cuda.empty_cache()
         
         # 调用test方法，默认生成完整报告
-        self.test(full_report=True)
+        metrics = self.test(full_report=True)
+        return metrics
     
     def test(self, full_report=True):
         del self.simplex_diffs
         self.simplex_diffs = self.best_diff_model
+
+        metrics = {}
 
         if self.args.ldl:
             # LDL模式下，获取预测结果并计算LDL指标
@@ -581,18 +584,20 @@ class Simplex_Trainer:
                 cheby, clark, can, kl, cosine, inter, improvement = self.compute_ldl_metrics(predictions, true_labels)
                 
                 # 保存测试结果到JSON文件
+                metrics = {
+                    'chebyshev': float(cheby),
+                    'clark': float(clark),
+                    'canberra': float(can),
+                    'kl_div': float(kl),
+                    'cosine_similarity': float(cosine),
+                    'intersection': float(inter),
+                    'test_acc': float(test_acc),
+                    'plm_acc': float(plm_acc),
+                    'improvement': float(improvement)
+                }
+                
                 result_data = {
-                    'metrics': {
-                        'chebyshev': float(cheby),
-                        'clark': float(clark),
-                        'canberra': float(can),
-                        'kl_div': float(kl),
-                        'cosine_similarity': float(cosine),
-                        'intersection': float(inter),
-                        'test_acc': float(test_acc),
-                        'plm_acc': float(plm_acc),
-                        'improvement': float(improvement)
-                    }
+                    'metrics': metrics
                 }
                 
                 # 保存结果到当前目录的result.json文件，供自动化脚本读取
@@ -605,7 +610,11 @@ class Simplex_Trainer:
         else:
             # 非LDL模式下，使用原有逻辑
             test_acc, plm_acc = self.evaluate(self.args.diff_epochs, self.test_dataloader)
+            metrics = {
+                'test_acc': float(test_acc),
+                'plm_acc': float(plm_acc)
+            }
         
         print(f"PLM test acc: {plm_acc}, Denoising test acc: {test_acc}")
-            
+        return metrics
             
